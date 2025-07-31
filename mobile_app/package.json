@@ -1,0 +1,50 @@
+{
+  "name": "3d-dimension-measurement-mobile",
+  "version": "1.0.0",
+  "description": "Mobile app for high-accuracy 3D dimension measurement with multi-sensor fusion",
+  "main": "App.js",
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web",
+    "test": "jest"
+  },
+  "dependencies": {
+    "expo": "~49.0.0",
+    "expo-camera": "~13.4.0",
+    "expo-sensors": "~12.3.0",
+    "expo-device": "~5.4.0",
+    "expo-file-system": "~15.4.0",
+    "react": "18.2.0",
+    "react-native": "0.72.0",
+    "react-native-gesture-handler": "~2.12.0",
+    "react-native-reanimated": "~3.3.0",
+    "react-native-safe-area-context": "4.6.0",
+    "react-native-screens": "~3.22.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.20.0",
+    "@babel/preset-env": "^7.20.0",
+    "@babel/runtime": "^7.20.0",
+    "@react-native/metro-config": "^0.72.0",
+    "@tsconfig/react-native": "^3.0.0",
+    "@types/react": "^18.0.24",
+    "@types/react-test-renderer": "^18.0.0",
+    "jest": "^29.2.1",
+    "metro-react-native-babel-preset": "0.76.0",
+    "prettier": "^2.4.1",
+    "react-test-renderer": "18.2.0",
+    "typescript": "4.8.4"
+  },
+  "keywords": [
+    "3d-measurement",
+    "computer-vision",
+    "mobile-app",
+    "sensor-fusion",
+    "dust3r",
+    "react-native"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}

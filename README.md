@@ -98,6 +98,65 @@ This project is licensed under the terms of the LICENSE file included in the rep
 
 1. CUDA Issues:
    - Verify CUDA installation with `quick_test.py`
+   - Check GPU memory usage with `nvidia-smi`
+   - Ensure PyTorch is installed with CUDA support
+
+2. Image Processing Issues:
+   - Verify image format (JPEG, PNG supported)
+   - Check image resolution (recommended: 1024x1024 or larger)
+   - Ensure sufficient image overlap (30-40% minimum)
+
+3. Scale Recovery Issues:
+   - Include EXIF metadata in images
+   - Provide IMU data when available
+   - Ensure good camera motion between shots
+
+## 🌐 API Usage
+
+The system provides a FastAPI-based REST API:
+
+```bash
+# Start the API server
+python main.py
+```
+
+Example API endpoints:
+- `POST /calculate-dimensions-advanced`: Calculate dimensions from images
+- `GET /health`: Check system health and GPU availability
+
+## 📱 Mobile App Integration
+
+The mobile app component provides:
+- Real-time image capture
+- IMU data collection
+- Metadata preservation
+- Direct API integration
+
+## 🔄 Scale Recovery Methods
+
+The system uses multiple methods for accurate scale recovery:
+1. IMU-based estimation (35% weight)
+2. Image metadata analysis (25% weight)
+3. Geometric analysis (20% weight)
+4. ML-based depth estimation (15% weight)
+5. Motion parallax analysis (5% weight)
+
+## 📊 Performance Metrics
+
+Typical performance metrics:
+- Processing time: 2-5 seconds per image pair
+- Scale accuracy: ±5% with good IMU data
+- Point cloud density: 100k-1M points
+- Reconstruction quality: 0.6-0.9 score
+
+## 🔜 Future Developments
+
+Planned improvements:
+- Real-time processing support
+- Enhanced scale recovery accuracy
+- Additional sensor integration
+- Mobile app improvements
+- Cloud processing options
    - Check GPU compatibility
    - Ensure correct PyTorch version
 

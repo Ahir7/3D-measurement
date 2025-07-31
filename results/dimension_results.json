@@ -1,0 +1,244 @@
+{
+  "success": 1.0,
+  "processing_time": 7.561731576919556,
+  "scale_recovery": {
+    "scale_factor": 0.11422729083219496,
+    "confidence": "0.066021524",
+    "methods_used": [
+      "geometric"
+    ],
+    "individual_estimates": {
+      "geometric": 0.11422729083219496
+    },
+    "individual_confidences": {
+      "geometric": "0.33010763"
+    }
+  },
+  "reconstruction_stats": {
+    "num_images": 5.0,
+    "num_3d_points": 983040.0,
+    "reconstruction_quality": 0.8
+  },
+  "dimensions_metric": {
+    "width_cm": 22.416808363454038,
+    "height_cm": 57.758018071134174,
+    "depth_cm": 96.04567283648385,
+    "volume_cm3": 124355.17548947554,
+    "surface_area_cm2": 6648.877599687043
+  },
+  "bounding_box": {
+    "min": [
+      -18.364389520748574,
+      -47.58373287952729,
+      -89.47720204965366
+    ],
+    "max": [
+      4.052418842705462,
+      10.174285191606886,
+      6.568470786830197
+    ],
+    "center": [
+      -7.155985339021556,
+      -18.704723843960203,
+      -41.45436563141173
+    ]
+  },
+  "confidence_metrics": {
+    "overall_confidence": "0.066021524",
+    "scale_methods_used": [
+      "geometric"
+    ],
+    "geometric_quality": 0.8
+  },
+  "metadata": {
+    "device": "cuda",
+    "model": "DUSt3R",
+    "image_metadata": [
+      {
+        "ImageWidth": 3072.0,
+        "ImageLength": 4096.0,
+        "GPSInfo": {
+          "1": "N",
+          "2": [
+            20.0,
+            36.0,
+            3.32
+          ],
+          "3": "E",
+          "4": [
+            72.0,
+            55.0,
+            19.62
+          ]
+        },
+        "ExifOffset": 145.0,
+        "Make": "Nothing",
+        "Model": "AIN065",
+        "Orientation": 1.0,
+        "DateTime": "2025:07:31 04:44:42",
+        "ApertureValue": 1.88,
+        "DateTimeOriginal": "2025:07:31 04:44:42",
+        "DateTimeDigitized": "2025:07:31 04:44:42",
+        "WhiteBalance": 0.0,
+        "ISOSpeedRatings": 588.0,
+        "Flash": 0.0,
+        "FocalLength": 5.59,
+        "OffsetTime": "+05:30",
+        "OffsetTimeOriginal": "+05:30",
+        "OffsetTimeDigitized": "+05:30",
+        "ExposureTime": 0.02,
+        "MakerNote": "b'NTDebugStart,ID:4,LUX:285.74,ADRC:1.49,AISCENE:0,IR:0.0,CCT:4308,HDRD:[CONF:(HDR:0.03,LLHDR:0.00),EXP:(OVER:0.00,UNDER:0.01)]NTDebugEnd'",
+        "FNumber": 1.88,
+        "ImageHeight": 4096.0
+      },
+      {
+        "ImageWidth": 3072.0,
+        "ImageLength": 4096.0,
+        "GPSInfo": {
+          "1": "N",
+          "2": [
+            20.0,
+            36.0,
+            3.32
+          ],
+          "3": "E",
+          "4": [
+            72.0,
+            55.0,
+            19.62
+          ]
+        },
+        "ExifOffset": 145.0,
+        "Make": "Nothing",
+        "Model": "AIN065",
+        "Orientation": 1.0,
+        "DateTime": "2025:07:31 04:44:48",
+        "ApertureValue": 1.88,
+        "DateTimeOriginal": "2025:07:31 04:44:48",
+        "DateTimeDigitized": "2025:07:31 04:44:48",
+        "WhiteBalance": 0.0,
+        "ISOSpeedRatings": 588.0,
+        "Flash": 0.0,
+        "FocalLength": 5.59,
+        "OffsetTime": "+05:30",
+        "OffsetTimeOriginal": "+05:30",
+        "OffsetTimeDigitized": "+05:30",
+        "ExposureTime": 0.02,
+        "MakerNote": "b'NTDebugStart,ID:4,LUX:287.33,ADRC:1.49,AISCENE:0,IR:0.0,CCT:4264,HDRD:[CONF:(HDR:0.04,LLHDR:0.00),EXP:(OVER:0.00,UNDER:0.06)]NTDebugEnd'",
+        "FNumber": 1.88,
+        "ImageHeight": 4096.0
+      },
+      {
+        "ImageWidth": 3072.0,
+        "ImageLength": 4096.0,
+        "GPSInfo": {
+          "1": "N",
+          "2": [
+            20.0,
+            36.0,
+            3.32
+          ],
+          "3": "E",
+          "4": [
+            72.0,
+            55.0,
+            19.62
+          ]
+        },
+        "ExifOffset": 145.0,
+        "Make": "Nothing",
+        "Model": "AIN065",
+        "Orientation": 1.0,
+        "DateTime": "2025:07:31 04:44:53",
+        "ApertureValue": 1.88,
+        "DateTimeOriginal": "2025:07:31 04:44:53",
+        "DateTimeDigitized": "2025:07:31 04:44:53",
+        "WhiteBalance": 0.0,
+        "ISOSpeedRatings": 588.0,
+        "Flash": 0.0,
+        "FocalLength": 5.59,
+        "OffsetTime": "+05:30",
+        "OffsetTimeOriginal": "+05:30",
+        "OffsetTimeDigitized": "+05:30",
+        "ExposureTime": 0.02,
+        "MakerNote": "b'NTDebugStart,ID:4,LUX:287.20,ADRC:1.49,AISCENE:0,IR:0.0,CCT:4305,HDRD:[CONF:(HDR:0.02,LLHDR:0.00),EXP:(OVER:0.00,UNDER:0.01)]NTDebugEnd'",
+        "FNumber": 1.88,
+        "ImageHeight": 4096.0
+      },
+      {
+        "ImageWidth": 3072.0,
+        "ImageLength": 4096.0,
+        "GPSInfo": {
+          "1": "N",
+          "2": [
+            20.0,
+            36.0,
+            3.32
+          ],
+          "3": "E",
+          "4": [
+            72.0,
+            55.0,
+            19.62
+          ]
+        },
+        "ExifOffset": 145.0,
+        "Make": "Nothing",
+        "Model": "AIN065",
+        "Orientation": 1.0,
+        "DateTime": "2025:07:31 04:44:59",
+        "ApertureValue": 1.88,
+        "DateTimeOriginal": "2025:07:31 04:44:59",
+        "DateTimeDigitized": "2025:07:31 04:44:59",
+        "WhiteBalance": 0.0,
+        "ISOSpeedRatings": 642.0,
+        "Flash": 0.0,
+        "FocalLength": 5.59,
+        "OffsetTime": "+05:30",
+        "OffsetTimeOriginal": "+05:30",
+        "OffsetTimeDigitized": "+05:30",
+        "ExposureTime": 0.02,
+        "MakerNote": "b'NTDebugStart,ID:4,LUX:291.90,ADRC:1.49,AISCENE:0,IR:0.0,CCT:4187,HDRD:[CONF:(HDR:0.03,LLHDR:0.00),EXP:(OVER:0.00,UNDER:0.00)]NTDebugEnd'",
+        "FNumber": 1.88,
+        "ImageHeight": 4096.0
+      },
+      {
+        "ImageWidth": 3072.0,
+        "ImageLength": 4096.0,
+        "GPSInfo": {
+          "1": "N",
+          "2": [
+            20.0,
+            36.0,
+            3.32
+          ],
+          "3": "E",
+          "4": [
+            72.0,
+            55.0,
+            19.62
+          ]
+        },
+        "ExifOffset": 145.0,
+        "Make": "Nothing",
+        "Model": "AIN065",
+        "Orientation": 1.0,
+        "DateTime": "2025:07:31 04:45:07",
+        "ApertureValue": 1.88,
+        "DateTimeOriginal": "2025:07:31 04:45:07",
+        "DateTimeDigitized": "2025:07:31 04:45:07",
+        "WhiteBalance": 0.0,
+        "ISOSpeedRatings": 623.0,
+        "Flash": 0.0,
+        "FocalLength": 5.59,
+        "OffsetTime": "+05:30",
+        "OffsetTimeOriginal": "+05:30",
+        "OffsetTimeDigitized": "+05:30",
+        "ExposureTime": 0.02,
+        "MakerNote": "b'NTDebugStart,ID:4,LUX:289.19,ADRC:1.47,AISCENE:0,IR:0.0,CCT:4301,HDRD:[CONF:(HDR:0.01,LLHDR:0.03),EXP:(OVER:0.00,UNDER:0.00)]NTDebugEnd'",
+        "FNumber": 1.88,
+        "ImageHeight": 4096.0
+      }
+    ]
+  }
+}
