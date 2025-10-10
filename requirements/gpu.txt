@@ -1,0 +1,30 @@
+# GPU and Deep Learning (CUDA 12.1)
+--index-url https://download.pytorch.org/whl/cu121
+torch>=2.2.0+cu121
+torchvision>=0.17.0+cu121
+
+# GPU Computing
+cupy-cuda12x>=12.0.0
+# pycuda>=2022.2  # Optional for custom CUDA kernels
+
+# 3D Reconstruction
+pycolmap>=0.5.0
+
+# Depth Estimation
+transformers>=4.35.0
+accelerate>=0.25.0
+
+# Marker Detection
+opencv-contrib-python>=4.8.0  # For ArUco markers
+# python-apriltag>=3.3.0  # Optional for AprilTag
+
+# API and Server
+fastapi>=0.105.0
+uvicorn[standard]>=0.25.0
+pydantic>=2.5.0
+python-multipart>=0.0.6
+aiofiles>=23.2.0
+
+# GPU Monitoring
+nvidia-ml-py>=12.535.0  # For pynvml
+
