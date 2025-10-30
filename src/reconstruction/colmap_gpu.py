@@ -36,6 +36,7 @@ class Reconstruction3D:
     colors: torch.Tensor  # Point colors [N, 3]
     camera_poses: List[torch.Tensor]  # Camera poses [num_images, 4, 4]
     camera_intrinsics: List[CameraIntrinsics]
+    image_names: List[str]
     point_errors: Optional[torch.Tensor] = None  # Reprojection errors
     num_observations: Optional[torch.Tensor] = None  # Observations per point
     
@@ -183,28 +184,47 @@ class COLMAPReconstructor:
         known_intrinsics: Optional[CameraIntrinsics]
     ) -> Reconstruction3D:
         """Reconstruct using pycolmap library."""
-        # Feature extraction
-        logger.info("Extracting features with GPU...")
-        pycolmap.extract_features(
-            database_path,
-            images_dir,
-            sift_options={
-                'max_num_features': self.config.num_features,
-                'use_gpu': True,
-                'gpu_index': self.config.gpu_index
-            }
-        )
+        # Verify CUDA is available
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA not available! GPU reconstruction requires CUDA.")
         
-        # Feature matching
-        logger.info("Matching features with GPU...")
-        pycolmap.match_exhaustive(
-            database_path,
-            sift_options={
-                'max_num_matches': self.config.max_num_matches,
-                'use_gpu': True,
-                'gpu_index': self.config.gpu_index
-            }
+        # Feature extraction with GPU - GPU ONLY MODE
+        logger.info(f"🎮 Extracting features with GPU (CUDA:{self.config.gpu_index})...")
+        logger.info("⚠️  GPU-ONLY MODE: pycolmap-cuda required")
+        
+        # Create Feature Extraction options (new API uses FeatureExtractionOptions)
+        extraction_options = pycolmap.FeatureExtractionOptions()
+        extraction_options.sift.max_num_features = self.config.num_features
+        
+        # Force CUDA device
+        device = pycolmap.Device.cuda
+        
+        logger.info(f"✅ Device: {device}, Max Features: {extraction_options.sift.max_num_features}")
+        
+        pycolmap.extract_features(
+            database_path=str(database_path),
+            image_path=str(images_dir),
+            extraction_options=extraction_options,
+            device=device
         )
+        logger.info("✅ GPU feature extraction completed!")
+        
+        # Feature matching with GPU - GPU ONLY MODE
+        logger.info("🎮 Matching features with GPU...")
+        
+        # Use FeatureMatchingOptions which contains sift options
+        matching_options = pycolmap.FeatureMatchingOptions()
+        matching_options.sift.max_ratio = 0.8  # Standard SIFT ratio test
+        matching_options.sift.cross_check = True
+        
+        logger.info(f"✅ Match options: ratio={matching_options.sift.max_ratio}, cross_check={matching_options.sift.cross_check}")
+        
+        pycolmap.match_exhaustive(
+            database_path=str(database_path),
+            matching_options=matching_options,
+            device=device
+        )
+        logger.info("✅ GPU feature matching completed!")
         
         # Sparse reconstruction
         logger.info("Running sparse reconstruction...")
@@ -298,6 +318,7 @@ class COLMAPReconstructor:
         # Extract camera poses
         camera_poses = []
         camera_intrinsics = []
+        image_names = []
         
         for image_id, image in reconstruction.images.items():
             # Get pose matrix (pycolmap v3.x uses cam_from_world)
@@ -316,14 +337,45 @@ class COLMAPReconstructor:
             pose[:3, :3] = R
             pose[:3, 3] = t
             camera_poses.append(pose)
+            image_names.append(image.name if hasattr(image, 'name') else str(image_id))
             
-            # Get intrinsics
+            # Get intrinsics (handle camera model mappings correctly)
             camera = reconstruction.cameras[image.camera_id]
+            params = camera.params
+            model = getattr(camera, 'model', None) or getattr(camera, 'model_name', None)
+
+            if isinstance(model, bytes):
+                model = model.decode('utf-8')
+
+            fx = fy = None
+            cx = cy = None
+
+            if model in ('SIMPLE_PINHOLE', 'SIMPLE_RADIAL', 'RADIAL'):
+                # COLMAP: [f, cx, cy, (k)] → fx=fy=f
+                f = params[0] if len(params) > 0 else max(camera.width, camera.height)
+                fx = f
+                fy = f
+                cx = params[1] if len(params) > 1 else camera.width / 2
+                cy = params[2] if len(params) > 2 else camera.height / 2
+            elif model in ('PINHOLE', 'OPENCV', 'OPENCV_FISHEYE', 'FULL_OPENCV', 'THIN_PRISM_FISHEYE'):
+                # COLMAP: [fx, fy, cx, cy, ...]
+                fx = params[0] if len(params) > 0 else max(camera.width, camera.height)
+                fy = params[1] if len(params) > 1 else fx
+                cx = params[2] if len(params) > 2 else camera.width / 2
+                cy = params[3] if len(params) > 3 else camera.height / 2
+            else:
+                # Fallback: assume simple pinhole
+                f = params[0] if len(params) > 0 else max(camera.width, camera.height)
+                fx = f
+                fy = f
+                cx = params[1] if len(params) > 1 else camera.width / 2
+                cy = params[2] if len(params) > 2 else camera.height / 2
+
             intrinsics = CameraIntrinsics(
-                fx=camera.params[0],
-                fy=camera.params[1] if len(camera.params) > 1 else camera.params[0],
-                cx=camera.params[2] if len(camera.params) > 2 else camera.width / 2,
-                cy=camera.params[3] if len(camera.params) > 3 else camera.height / 2,
+                fx=float(fx),
+                fy=float(fy),
+                cx=float(cx),
+                cy=float(cy),
                 width=camera.width,
                 height=camera.height
             )
@@ -335,7 +387,8 @@ class COLMAPReconstructor:
             camera_poses=[torch.from_numpy(p) for p in camera_poses],
             camera_intrinsics=camera_intrinsics,
             point_errors=torch.from_numpy(point_errors),
-            num_observations=torch.from_numpy(num_observations)
+            num_observations=torch.from_numpy(num_observations),
+            image_names=image_names
         )
     
     def _load_binary_reconstruction(self, sparse_dir: Path) -> Reconstruction3D:
@@ -362,6 +415,7 @@ class COLMAPReconstructor:
             colors=reconstruction.colors.to(self.device),
             camera_poses=[p.to(self.device) for p in reconstruction.camera_poses],
             camera_intrinsics=reconstruction.camera_intrinsics,
+            image_names=reconstruction.image_names,
             point_errors=reconstruction.point_errors.to(self.device) if reconstruction.point_errors is not None else None,
             num_observations=reconstruction.num_observations.to(self.device) if reconstruction.num_observations is not None else None
         )

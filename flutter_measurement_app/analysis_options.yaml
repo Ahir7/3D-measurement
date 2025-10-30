@@ -1,0 +1,27 @@
+include: package:flutter_lints/flutter.yaml
+
+linter:
+  rules:
+    prefer_const_constructors: true
+    prefer_const_literals_to_create_immutables: true
+    avoid_print: false
+    prefer_single_quotes: false
+    unnecessary_new: true
+    unnecessary_null_in_if_null_operators: true
+    prefer_is_empty: true
+    prefer_is_not_empty: true
+    prefer_final_fields: true
+    use_key_in_widget_constructors: true
+    avoid_unnecessary_containers: true
+    sized_box_for_whitespace: true
+    prefer_const_constructors_in_immutables: true
+
+analyzer:
+  exclude:
+    - "**/*.g.dart"
+    - "**/*.freezed.dart"
+  
+  errors:
+    missing_required_param: error
+    missing_return: error
+

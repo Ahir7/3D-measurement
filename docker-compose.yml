@@ -1,56 +1,58 @@
-version: '3.8'
+# Docker Compose for 3D Measurement System (CPU-Only)
+# Version: 2.0.0
+# 
+# WARNING: This is the CPU-only version. Performance will be very slow.
+# For production use, please use docker-compose.gpu.yml instead.
+#
+# Usage:
+#   docker-compose up -d
+#   docker-compose logs -f
+#   docker-compose down
 
 services:
-  dimension-calculator:
-    build: 
+  measurement-system:
+    build:
       context: .
       dockerfile: Dockerfile
+    
+    image: 3d-measurement:cpu-v2.0
+    container_name: 3d-measurement-cpu
+    
+    # Port mapping
     ports:
       - "8000:8000"
+    
+    # Environment variables
     environment:
-      - DEVICE=cuda
-      - MODEL_PATH=/app/data/models
-      - MAX_WORKERS=4
+      - LOG_LEVEL=INFO
+      - DEVICE=cpu
+      - WORKERS=1
+    
+    # Volume mounts
     volumes:
-      - ./data:/app/data
       - ./output:/app/output
       - ./logs:/app/logs
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    depends_on:
-      - redis
+      - ./data:/app/data
+    
+    # Restart policy
     restart: unless-stopped
+    
+    # Health check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 60s
+    
+    # Networking
+    networks:
+      - measurement-network
+    
+    # Resource limits
+    mem_limit: 8g
+    memswap_limit: 8g
 
-  redis:
-    image: redis:7-alpine
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-    command: redis-server --appendonly yes
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-      - "443:443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
-      - ./ssl:/etc/nginx/ssl
-    depends_on:
-      - dimension-calculator
-    restart: unless-stopped
-
-volumes:
-  redis_data:
+networks:
+  measurement-network:
+    driver: bridge

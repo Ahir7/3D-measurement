@@ -1,22 +1,26 @@
 # GPU and Deep Learning (CUDA 12.1)
+# Install PyTorch with CUDA support first
 --index-url https://download.pytorch.org/whl/cu121
-torch>=2.2.0+cu121
-torchvision>=0.17.0+cu121
+torch>=2.2.0
+torchvision>=0.17.0
 
-# GPU Computing
-cupy-cuda12x>=12.0.0
-# pycuda>=2022.2  # Optional for custom CUDA kernels
+# Reset to default PyPI for remaining packages
+--index-url https://pypi.org/simple
 
 # 3D Reconstruction
-pycolmap>=0.5.0
+# NOTE: pycolmap from PyPI does NOT have CUDA support!
+# For GPU-accelerated COLMAP, install system package:
+#   sudo apt install colmap
+# Or use pycolmap-cuda (requires CUDA 12.x):
+#   pip install pycolmap-cuda
+pycolmap
 
 # Depth Estimation
 transformers>=4.35.0
 accelerate>=0.25.0
 
 # Marker Detection
-opencv-contrib-python>=4.8.0  # For ArUco markers
-# python-apriltag>=3.3.0  # Optional for AprilTag
+opencv-contrib-python>=4.8.0
 
 # API and Server
 fastapi>=0.105.0
@@ -25,6 +29,5 @@ pydantic>=2.5.0
 python-multipart>=0.0.6
 aiofiles>=23.2.0
 
-# GPU Monitoring
-nvidia-ml-py>=12.535.0  # For pynvml
-
+# GPU Monitoring (optional)
+pynvml>=11.5.0

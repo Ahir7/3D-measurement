@@ -21,7 +21,7 @@ class GPUConfig:
     device: str = "cuda:0"
     mixed_precision: bool = True
     num_streams: int = 4
-    memory_fraction: float = 0.9
+    memory_fraction: float = 0.92  # Optimized for 6GB+ GPUs
     allow_tf32: bool = True
     
     def validate(self) -> bool:
@@ -52,14 +52,14 @@ class GPUConfig:
 class COLMAPConfig:
     """COLMAP reconstruction configuration."""
     
-    # Feature extraction
-    num_features: int = 16384
+    # Feature extraction - Optimized for RTX 2060 6GB
+    num_features: int = 32768  # 2x increase for 6GB GPUs
     use_gpu: bool = True
     gpu_index: str = "0"
     
     # Matching
     matching_method: str = "exhaustive"
-    max_num_matches: int = 32768
+    max_num_matches: int = 65536  # 2x increase for 6GB GPUs
     
     # Bundle adjustment
     ba_refine_focal_length: bool = True
@@ -77,40 +77,49 @@ class Metric3DConfig:
     
     model_name: str = "metric3d_vit_large"
     input_size: Tuple[int, int] = (518, 518)
-    max_input_size: Tuple[int, int] = (2160, 3840)  # 4K
+    max_input_size: Tuple[int, int] = (2160, 2880)  # 6MP max for 6GB GPUs
     
     # Inference settings
     use_mixed_precision: bool = True
-    compile_model: bool = True
+    compile_model: bool = False  # Disabled: 10+ min first-time compilation
     use_tensorrt: bool = False
     
     # Depth processing
-    depth_scale_factor: float = 1.0
+    depth_scale_factor: float = 1.0  # Keep 1.0; apply post-scale calibration instead
     min_depth: float = 0.1  # meters
     max_depth: float = 100.0  # meters
+    
+    # Depth normalization range (for indoor scenes)
+    near_depth: float = 1.0  # meters - closest expected objects
+    far_depth: float = 8.0   # meters - farthest expected objects
 
 
 @dataclass
 class ScaleRecoveryConfig:
     """Multi-source scale recovery configuration."""
     
-    # Method weights
-    marker_weight: float = 0.40
-    imu_weight: float = 0.25
-    depth_weight: float = 0.20
-    object_weight: float = 0.15
+    # Method weights - Depth-only (no markers/IMU/object)
+    marker_weight: float = 0.0
+    imu_weight: float = 0.0
+    depth_weight: float = 1.0
+    object_weight: float = 0.0
     
-    # Marker detection
-    marker_types: List[str] = field(default_factory=lambda: ["aruco", "qr", "apriltag"])
-    marker_size_mm: float = 100.0  # Default marker size
+    # Marker detection (disabled in depth-only mode)
+    marker_types: List[str] = field(default_factory=list)
+    marker_size_mm: float = 100.0
     
     # IMU settings
     imu_sampling_rate: float = 100.0  # Hz
     imu_gravity: Tuple[float, float, float] = (0.0, 0.0, -9.81)
     
-    # Confidence thresholds
-    min_confidence: float = 0.5
-    min_methods_required: int = 2
+    # Confidence thresholds - depth-only accepts any estimate
+    min_confidence: float = 0.0
+    min_methods_required: int = 1  # Allow single method if confidence > threshold
+    
+    # Depth-only mode calibration
+    # This corrects the absolute scale after depth-based scale recovery
+    # Calibrate by measuring a known object and using: true_size / measured_size
+    depth_only_calibration: float = 1.0  # 1.0 = no correction
     
     # Known object detection
     object_database: Optional[str] = None
@@ -126,8 +135,8 @@ class SystemConfig:
     metric3d: Metric3DConfig = field(default_factory=Metric3DConfig)
     scale_recovery: ScaleRecoveryConfig = field(default_factory=ScaleRecoveryConfig)
     
-    # Processing settings
-    batch_size: int = 1
+    # Processing settings - Optimized for RTX 2060 6GB
+    batch_size: int = 3  # 3x increase for 6GB GPUs
     max_image_size: int = 2048
     min_images: int = 3
     max_images: int = 50

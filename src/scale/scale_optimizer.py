@@ -105,9 +105,18 @@ class ScaleOptimizer:
         
         # Method 3: Depth-based scale
         if self.config.depth_weight > 0 and depth_maps is not None:
-            depth_estimate = self._estimate_from_depth(depth_maps, reconstruction)
-            if depth_estimate:
-                estimates.append(depth_estimate)
+            aligned_estimate = None
+            if reconstruction.get('camera_intrinsics'):
+                aligned_estimate = self._estimate_from_depth_aligned(
+                    depth_maps,
+                    reconstruction
+                )
+            if aligned_estimate:
+                estimates.append(aligned_estimate)
+            else:
+                depth_estimate = self._estimate_from_depth(depth_maps, reconstruction)
+                if depth_estimate:
+                    estimates.append(depth_estimate)
         
         # Method 4: Object-based scale
         if self.config.object_weight > 0:
@@ -195,11 +204,14 @@ class ScaleOptimizer:
             avg_scale = np.average(scales, weights=confidences)
             avg_confidence = np.mean(confidences) * self.config.marker_weight
             
-            logger.info(f"Marker-based scale: {avg_scale:.4f} mm/px from {len(scales)} markers")
+            # Convert from mm/px to meters/px for compatibility with measurement system
+            avg_scale_meters = avg_scale / 1000.0
+            
+            logger.info(f"Marker-based scale: {avg_scale:.4f} mm/px ({avg_scale_meters:.6f} m/px) from {len(scales)} markers")
             
             return ScaleEstimate(
                 method="marker",
-                scale_factor=float(avg_scale),
+                scale_factor=float(avg_scale_meters),  # Use meters, not millimeters
                 confidence=float(avg_confidence),
                 metadata={'num_markers': len(scales)}
             )
@@ -288,16 +300,25 @@ class ScaleOptimizer:
         depth_maps: torch.Tensor,
         reconstruction: Dict
     ) -> Optional[ScaleEstimate]:
-        """Estimate scale from depth maps."""
+        """
+        Estimate scale from depth maps with improved confidence calculation.
+        
+        Uses multi-factor confidence based on:
+        1. Depth consistency (lower variance = better)
+        2. Reconstruction quality (more points = better)
+        3. Coverage (more images = better)
+        """
         try:
             points = reconstruction.get('points')
             if points is None:
                 return None
             
-            # Calculate median depth from depth maps
-            median_depth = torch.median(depth_maps[depth_maps > 0]).item()
+            # Calculate depth statistics
+            valid_depth = depth_maps[depth_maps > 0]
+            median_depth = torch.median(valid_depth).item()
+            depth_std = torch.std(valid_depth).item()
             
-            # Calculate median distance from reconstruction
+            # Calculate reconstruction statistics
             if isinstance(points, torch.Tensor):
                 points_np = points.cpu().numpy()
             else:
@@ -309,27 +330,246 @@ class ScaleOptimizer:
             if median_distance < 1e-6:
                 return None
             
-            # Scale = depth_real / depth_reconstruction
+            # Scale estimation: depth_real / depth_reconstruction
             scale = median_depth / median_distance
             
-            # Confidence based on depth map quality
-            depth_std = torch.std(depth_maps[depth_maps > 0]).item()
-            depth_consistency = 1.0 - min(depth_std / median_depth, 1.0)
-            confidence = depth_consistency * self.config.depth_weight
+            # Multi-factor confidence calculation
             
-            logger.info(f"Depth-based scale: {scale:.4f} from median depth {median_depth:.3f}m")
+            # Factor 1: Depth consistency (coefficient of variation)
+            depth_cv = depth_std / (median_depth + 1e-6)
+            consistency_score = np.exp(-depth_cv)  # Range [0, 1], higher is better
+            
+            # Factor 2: Reconstruction quality (number of points)
+            num_points = len(points_np)
+            point_score = min(num_points / 500.0, 1.0)  # Saturates at 500 points
+            
+            # Factor 3: Depth coverage (number of images)
+            num_images = depth_maps.shape[0]
+            coverage_score = min(num_images / 15.0, 1.0)  # Saturates at 15 images
+            
+            # Combined confidence (weighted average)
+            confidence_raw = (
+                consistency_score * 0.5 +  # Consistency is most important
+                point_score * 0.3 +        # Quality matters
+                coverage_score * 0.2       # Coverage helps
+            )
+            
+            # Apply depth weight (1.0 in depth-only mode)
+            confidence = confidence_raw * self.config.depth_weight
+            
+            logger.info(
+                f"Depth-based scale: {scale:.4f} "
+                f"(median_depth={median_depth:.3f}m, "
+                f"median_dist={median_distance:.3f}, "
+                f"consistency={consistency_score:.2f}, "
+                f"points={num_points}, images={num_images}, "
+                f"confidence={confidence:.2f})"
+            )
             
             return ScaleEstimate(
                 method="depth",
                 scale_factor=float(scale),
                 confidence=float(confidence),
-                metadata={'median_depth': median_depth, 'consistency': depth_consistency}
+                metadata={
+                    'median_depth': median_depth,
+                    'depth_std': depth_std,
+                    'depth_cv': depth_cv,
+                    'consistency_score': consistency_score,
+                    'num_points': num_points,
+                    'num_images': num_images,
+                    'point_score': point_score,
+                    'coverage_score': coverage_score
+                }
             )
             
         except Exception as e:
             logger.error(f"Depth-based scale estimation failed: {e}")
             return None
     
+    def _estimate_from_depth_aligned(
+        self,
+        depth_maps: torch.Tensor,
+        reconstruction: Dict
+    ) -> Optional[ScaleEstimate]:
+        """Estimate scale by aligning COLMAP points with depth maps."""
+        try:
+            points = reconstruction.get('points')
+            camera_poses = reconstruction.get('camera_poses')
+            camera_intrinsics = reconstruction.get('camera_intrinsics')
+            image_names = reconstruction.get('image_names')
+
+            if points is None or camera_poses is None or camera_intrinsics is None:
+                return None
+
+            if isinstance(points, torch.Tensor):
+                points_np = points.detach().cpu().numpy()
+            else:
+                points_np = points
+
+            if points_np.shape[0] == 0:
+                return None
+
+            # Limit number of points for efficiency
+            max_points = 8000
+            if points_np.shape[0] > max_points:
+                rng = np.random.default_rng(seed=42)
+                indices = rng.choice(points_np.shape[0], size=max_points, replace=False)
+                points_np = points_np[indices]
+
+            per_view_scales = []
+            per_view_weights = []
+
+            num_depth_maps = depth_maps.shape[0]
+
+            # Align COLMAP views with input image order based on file names
+            ordered_poses: List[Optional[torch.Tensor]] = [None] * num_depth_maps
+            ordered_intrinsics: List[Optional[object]] = [None] * num_depth_maps
+
+            if image_names and len(image_names) == len(camera_poses):
+                for pose, intrinsics, name in zip(camera_poses, camera_intrinsics, image_names):
+                    index = None
+                    if isinstance(name, str):
+                        base = name.split('.')[0]
+                        if '_' in base:
+                            suffix = base.split('_')[-1]
+                            if suffix.isdigit():
+                                index = int(suffix)
+                    if index is not None and 0 <= index < num_depth_maps:
+                        ordered_poses[index] = pose
+                        ordered_intrinsics[index] = intrinsics
+
+            # Fallback: if alignment failed, use sequential order
+            for i in range(num_depth_maps):
+                if ordered_poses[i] is None and i < len(camera_poses):
+                    ordered_poses[i] = camera_poses[i]
+                if ordered_intrinsics[i] is None and i < len(camera_intrinsics):
+                    ordered_intrinsics[i] = camera_intrinsics[i]
+
+            for view_idx in range(num_depth_maps):
+                pose = ordered_poses[view_idx]
+                intrinsics = ordered_intrinsics[view_idx]
+
+                if pose is None or intrinsics is None:
+                    continue
+
+                if isinstance(pose, torch.Tensor):
+                    pose_np = pose.detach().cpu().numpy()
+                else:
+                    pose_np = pose
+
+                R = pose_np[:3, :3]
+                t = pose_np[:3, 3]
+
+                depth_map = depth_maps[view_idx].detach().cpu().numpy()
+                H, W = depth_map.shape
+
+                # Project points into current camera
+                points_cam = (R @ points_np.T + t.reshape(3, 1)).T
+
+                positive_z = points_cam[:, 2] > 1e-6
+                if positive_z.sum() < 100:
+                    continue
+
+                points_cam = points_cam[positive_z]
+
+                u = points_cam[:, 0] / points_cam[:, 2]
+                v = points_cam[:, 1] / points_cam[:, 2]
+
+                u = u * intrinsics.fx + intrinsics.cx
+                v = v * intrinsics.fy + intrinsics.cy
+
+                # Valid pixel locations (allow room for bilinear sampling)
+                valid_u = (u >= 1) & (u < W - 2)
+                valid_v = (v >= 1) & (v < H - 2)
+                valid = valid_u & valid_v
+
+                if valid.sum() < 100:
+                    continue
+
+                u = u[valid]
+                v = v[valid]
+                depths_colmap = points_cam[valid, 2]
+
+                # Bilinear interpolation from depth map
+                u0 = np.floor(u).astype(np.int32)
+                v0 = np.floor(v).astype(np.int32)
+                du = u - u0
+                dv = v - v0
+
+                depth_samples = (
+                    (1 - du) * (1 - dv) * depth_map[v0, u0] +
+                    du * (1 - dv) * depth_map[v0, u0 + 1] +
+                    (1 - du) * dv * depth_map[v0 + 1, u0] +
+                    du * dv * depth_map[v0 + 1, u0 + 1]
+                )
+
+                valid_depths = depth_samples > 0.05
+                if valid_depths.sum() < 50:
+                    continue
+
+                ratios = depth_samples[valid_depths] / (depths_colmap[valid_depths] + 1e-6)
+
+                if ratios.size < 50:
+                    continue
+
+                # Robust outlier removal using MAD
+                median_ratio = np.median(ratios)
+                mad = np.median(np.abs(ratios - median_ratio)) + 1e-6
+                inliers = np.abs(ratios - median_ratio) <= (3.0 * mad)
+
+                if inliers.sum() < 30:
+                    continue
+
+                ratios_inliers = ratios[inliers]
+                scale_view = np.median(ratios_inliers)
+                dispersion = np.std(ratios_inliers)
+
+                inlier_ratio = inliers.sum() / len(ratios)
+                consistency = np.exp(-dispersion / (abs(scale_view) + 1e-6))
+
+                per_view_scales.append(scale_view)
+                per_view_weights.append(max(inlier_ratio * consistency, 1e-3))
+
+            if not per_view_scales:
+                return None
+
+            per_view_scales = np.array(per_view_scales)
+            per_view_weights = np.array(per_view_weights)
+            per_view_weights = per_view_weights / per_view_weights.sum()
+
+            scale = float(np.sum(per_view_scales * per_view_weights))
+
+            # Confidence combines view consistency and coverage
+            if len(per_view_scales) > 1:
+                scale_std = np.std(per_view_scales)
+                scale_mean = np.mean(per_view_scales)
+                view_consistency = np.exp(-scale_std / (abs(scale_mean) + 1e-6))
+            else:
+                view_consistency = 0.7
+
+            coverage = min(len(per_view_scales) / 10.0, 1.0)
+            confidence = (view_consistency * 0.6 + coverage * 0.4) * self.config.depth_weight
+
+            logger.info(
+                f"Depth-aligned scale: {scale:.4f} from {len(per_view_scales)} views, "
+                f"consistency={view_consistency:.2f}, coverage={coverage:.2f}"
+            )
+
+            return ScaleEstimate(
+                method="depth_aligned",
+                scale_factor=float(scale),
+                confidence=float(confidence),
+                metadata={
+                    'views_used': len(per_view_scales),
+                    'weights': per_view_weights.tolist(),
+                    'view_scales': per_view_scales.tolist()
+                }
+            )
+
+        except Exception as e:
+            logger.error(f"Depth-aligned scale estimation failed: {e}")
+            return None
+
     def _estimate_from_objects(self, images: torch.Tensor) -> Optional[ScaleEstimate]:
         """Estimate scale from known objects (placeholder)."""
         # This would use object detection to find known objects
@@ -354,22 +594,26 @@ class ScaleOptimizer:
         if not estimates:
             return 1.0, 0.0, 0
         
-        # Filter by confidence
-        valid_estimates = [
-            e for e in estimates 
-            if e.confidence >= self.config.min_confidence
-        ]
+        # Filter by confidence (allow all if threshold <= 0)
+        if self.config.min_confidence > 0.0:
+            valid_estimates = [e for e in estimates if e.confidence >= self.config.min_confidence]
+        else:
+            valid_estimates = estimates[:]
         
         if not valid_estimates:
-            logger.warning("No estimates meet minimum confidence threshold")
+            logger.warning("No scale estimates available")
             return 1.0, 0.0, 0
         
         # Simple weighted average
         scales = np.array([e.scale_factor for e in valid_estimates])
         weights = np.array([e.confidence for e in valid_estimates])
         
-        # Normalize weights
-        weights = weights / weights.sum()
+        # Normalize weights (fallback to uniform if all zeros)
+        wsum = weights.sum()
+        if wsum <= 1e-8:
+            weights = np.ones_like(weights) / len(weights)
+        else:
+            weights = weights / wsum
         
         # Weighted average
         optimized_scale = np.average(scales, weights=weights)

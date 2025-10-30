@@ -119,21 +119,24 @@ class Metric3DEstimator:
         if hasattr(self.model, 'gradient_checkpointing_enable'):
             self.model.gradient_checkpointing_enable()
         
-        # Compile model with torch.compile() for speedup (skip on Windows - Triton not supported)
+        # torch.compile() DISABLED for GPUs with <8GB VRAM
+        # First-time compilation takes 10-20 minutes and uses extra GPU memory
+        # The speedup (2-3x) is not worth the overhead for smaller GPUs
+        # Re-enable by changing 'if False' to 'if platform.system() != "Windows"'
         import platform
-        if platform.system() != 'Windows':
+        if False and platform.system() != 'Windows':
             logger.info("Compiling model with torch.compile()...")
             self.model = torch.compile(self.model, mode="reduce-overhead")
             logger.info("Model compilation enabled")
         else:
-            logger.info("Skipping torch.compile() on Windows (Triton not supported)")
+            logger.info("torch.compile() disabled (recommended for GPUs with <8GB VRAM)")
     
     @torch.amp.autocast(device_type='cuda', enabled=True)
     def estimate_depth(
         self,
         images: torch.Tensor,
         return_confidence: bool = False,
-        batch_size: int = 2  # Process 2 images at a time for 4GB GPU
+        batch_size: int = 3  # Process 3 images at a time for 6GB GPU
     ) -> List[DepthEstimation]:
         """
         Estimate metric depth from images with batched processing for memory efficiency.
@@ -141,7 +144,7 @@ class Metric3DEstimator:
         Args:
             images: Input images tensor [B, 3, H, W] or [B, H, W, 3]
             return_confidence: Whether to compute confidence maps
-            batch_size: Number of images to process at once (default 2 for 4GB GPU)
+            batch_size: Number of images to process at once (default 3 for 6GB GPU)
             
         Returns:
             List of DepthEstimation objects for each image
@@ -160,6 +163,9 @@ class Metric3DEstimator:
         
         total_images = images.shape[0]
         logger.info(f"Estimating depth for {total_images} images in batches of {batch_size}")
+        
+        # Store original image sizes (H, W) for each image before preprocessing
+        original_sizes = [(images.shape[2], images.shape[3]) for _ in range(total_images)]
         
         # Start timing
         start_time = torch.cuda.Event(enable_timing=True)
@@ -187,9 +193,13 @@ class Metric3DEstimator:
                 
                 # Post-process and collect results
                 for i in range(current_batch_size):
+                    # Get original size for this specific image
+                    img_idx = batch_idx + i
+                    target_size = original_sizes[img_idx]
+                    
                     depth_map = self._postprocess(
                         depth_maps[i],
-                        target_size=batch_images.shape[2:]
+                        target_size=target_size
                     )
                     
                     confidence_map = None
@@ -294,19 +304,21 @@ class Metric3DEstimator:
         Returns:
             Processed depth map in meters
         """
-        # Ensure 2D
-        if depth.dim() == 3:
+        # Ensure 2D - handle various output formats
+        while depth.dim() > 2:
             depth = depth.squeeze(0)
-        elif depth.dim() == 4:
-            depth = depth.squeeze(0).squeeze(0)
         
-        # Resize to target size
+        # Ensure we have a 2D tensor [H, W]
+        if depth.dim() != 2:
+            raise ValueError(f"Expected 2D depth map, got shape {depth.shape}")
+        
+        # Resize to target size - add batch and channel dims [1, 1, H, W]
         depth_resized = F.interpolate(
             depth.unsqueeze(0).unsqueeze(0),
             size=target_size,
             mode='bilinear',
             align_corners=False
-        ).squeeze()
+        ).squeeze()  # Remove batch and channel dims back to [H, W]
         
         # Normalize to metric scale
         depth_normalized = self._normalize_depth(depth_resized)
@@ -322,24 +334,35 @@ class Metric3DEstimator:
     
     def _normalize_depth(self, depth: torch.Tensor) -> torch.Tensor:
         """
-        Normalize depth to metric scale.
+        Normalize DPT-Large depth to metric scale.
+        
+        DPT-Large is trained on multiple datasets (MIX-6) with metric depth.
+        The model outputs inverse depth (disparity), which we need to convert
+        to absolute metric depth.
         
         Args:
-            depth: Raw depth values
+            depth: Raw depth values from DPT-Large
             
         Returns:
             Depth in meters
         """
-        # Simple normalization - should be calibrated per model
-        depth_min = depth.min()
-        depth_max = depth.max()
+        # Use percentile-based normalization (more robust than min/max)
+        p1, p99 = torch.quantile(depth, torch.tensor([0.01, 0.99], device=depth.device))
         
-        if depth_max > depth_min:
-            depth_norm = (depth - depth_min) / (depth_max - depth_min)
-            # Scale to reasonable depth range (0.5m to 10m)
-            depth_metric = depth_norm * (10.0 - 0.5) + 0.5
-        else:
-            depth_metric = torch.ones_like(depth)
+        # Normalize to [0, 1] using percentiles
+        depth_norm = (depth - p1) / (p99 - p1 + 1e-6)
+        depth_norm = torch.clamp(depth_norm, 0, 1)
+        
+        # DPT-Large calibration for typical indoor scenes
+        # Use configurable depth range (default: 1-8m for indoor)
+        depth_metric = depth_norm * (self.config.far_depth - self.config.near_depth) + self.config.near_depth
+        
+        # Final clipping to physically reasonable range
+        depth_metric = torch.clamp(
+            depth_metric, 
+            self.config.min_depth,
+            self.config.max_depth
+        )
         
         return depth_metric * self.config.depth_scale_factor
     

@@ -43,9 +43,12 @@ ehthumbs.db
 Thumbs.db
 
 # Data and Models
-data/models/*.pth
-data/models/*.pkl
-data/test_images/*
+data/models/
+*.pth
+*.onnx
+*.pt
+*.pkl
+data/test_images/
 !data/test_images/.gitkeep
 output/
 logs/
@@ -75,6 +78,18 @@ htmlcov/
 
 # Documentation
 docs/_build/
+*.md.tmp
+
+# Python cache
+*.cache/
+.mypy_cache/
+.ruff_cache/
+__pypackages__/
+
+# Build artifacts
+*.whl
+*.tar.gz
+pip-wheel-metadata/
 
 # Node modules (for mobile app)
 node_modules/

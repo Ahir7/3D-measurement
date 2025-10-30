@@ -238,7 +238,9 @@ class MeasurementSystemGPU:
             logger.info("Recovering metric scale...")
             reconstruction_dict = {
                 'points': reconstruction.points,
-                'camera_poses': reconstruction.camera_poses
+                'camera_poses': reconstruction.camera_poses,
+                'camera_intrinsics': reconstruction.camera_intrinsics,
+                'image_names': reconstruction.image_names
             }
             
             scale_result = self.scale_optimizer.recover_scale(
@@ -251,6 +253,12 @@ class MeasurementSystemGPU:
             
             # Apply scale to point cloud
             scaled_points = reconstruction.points * scale_result.scale_factor
+            
+            # Apply depth-only calibration if configured
+            if self.config.scale_recovery.depth_only_calibration != 1.0:
+                calibration = self.config.scale_recovery.depth_only_calibration
+                scaled_points = scaled_points * calibration
+                logger.info(f"Applied depth-only calibration factor: {calibration:.6f}")
             
             # Compute dimensions
             logger.info("Computing final measurements...")
@@ -364,6 +372,9 @@ class MeasurementSystemGPU:
             points_np = points
         
         # Remove outliers using both methods
+        # NOTE: Keeping STRICT filtering (eps=0.05) because with 707 sparse points,
+        # we need aggressive filtering to remove background/noise points.
+        # Less strict filtering includes too many outliers, making bbox way too large.
         logger.info(f"Processing {len(points_np)} points...")
         points_clean = remove_outliers(points_np, method='both', eps=0.05, min_samples=10)
         logger.info(f"After outlier removal: {len(points_clean)} points")

@@ -36,7 +36,7 @@ def serve_command(args):
 
 
 def measure_command(args):
-    """Run measurement from command line."""
+    """Run measurement from command line with optional multiple runs for averaging."""
     import torch
     import cv2
     import numpy as np
@@ -70,6 +70,11 @@ def measure_command(args):
     
     logger.info(f"Loaded {len(images)} images")
     
+    # Check if multiple runs requested
+    num_runs = getattr(args, 'num_runs', 1)
+    if num_runs > 1:
+        logger.info(f"Multiple measurements mode: {num_runs} runs for averaging")
+    
     # Load optional data
     imu_data = None
     if args.imu_data:
@@ -85,43 +90,156 @@ def measure_command(args):
     
     # Initialize system
     logger.info("Initializing measurement system...")
-    config = SystemConfig()
+    
+    # Load config from file if provided
+    if hasattr(args, 'config') and args.config:
+        import importlib.util
+        config_path = Path(args.config)
+        if not config_path.exists():
+            logger.error(f"Config file not found: {args.config}")
+            return 1
+        
+        # Load config module dynamically
+        spec = importlib.util.spec_from_file_location("custom_config", config_path)
+        config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(config_module)
+        
+        # Get config from module
+        if hasattr(config_module, 'get_config'):
+            config = config_module.get_config()
+            logger.info(f"Loaded config from: {args.config}")
+        else:
+            logger.error(f"Config file must have get_config() function")
+            return 1
+    else:
+        config = SystemConfig()
+    
     config.output_dir = Path(args.output)
     system = MeasurementSystemGPU(config)
     
-    # Run measurement
-    logger.info("Running measurement...")
-    result = system.measure(
-        images=images,
-        image_paths=image_paths,
-        imu_data=imu_data,
-        metadata=metadata
-    )
-    
-    # Print results
-    print("\n" + "=" * 60)
-    print("MEASUREMENT RESULTS")
-    print("=" * 60)
-    
-    if result.error_bounds:
-        # Print with error bounds
-        print(f"Width:  {result.measurements['width']:.2f} ± {result.error_bounds['width_error']:.2f} cm")
-        print(f"Height: {result.measurements['height']:.2f} ± {result.error_bounds['height_error']:.2f} cm")
-        print(f"Depth:  {result.measurements['depth']:.2f} ± {result.error_bounds['depth_error']:.2f} cm")
-        print(f"Volume: {result.measurements['volume_cm3']:.2f} ± {result.error_bounds.get('volume_error', 0):.2f} cm³")
-        print(f"\nEstimated Error: ±{result.error_bounds['relative_error_percent']:.1f}%")
-        print(f"Quality: {result.error_bounds.get('quality', 'N/A')}")
+    # Run measurement (multiple times if requested)
+    if num_runs > 1:
+        results = []
+        for run_idx in range(num_runs):
+            print(f"\n{'='*60}")
+            print(f"RUN {run_idx + 1}/{num_runs}")
+            print('='*60)
+            
+            # Shuffle images for robustness (except first run)
+            if run_idx > 0:
+                import random
+                combined = list(zip(images, image_paths))
+                random.shuffle(combined)
+                shuffled_images, shuffled_paths = zip(*combined)
+                run_images = list(shuffled_images)
+                run_paths = list(shuffled_paths)
+            else:
+                run_images = images
+                run_paths = image_paths
+            
+            result = system.measure(
+                images=run_images,
+                image_paths=run_paths,
+                imu_data=imu_data,
+                metadata=metadata
+            )
+            results.append(result)
+            
+            print(f"Width: {result.measurements['width']:.2f} cm, "
+                  f"Height: {result.measurements['height']:.2f} cm, "
+                  f"Depth: {result.measurements['depth']:.2f} cm")
+        
+        # Compute averaged results
+        print(f"\n{'='*60}")
+        print("AVERAGED RESULTS (MEDIAN)")
+        print('='*60)
+        
+        widths = [r.measurements['width'] for r in results]
+        heights = [r.measurements['height'] for r in results]
+        depths = [r.measurements['depth'] for r in results]
+        volumes = [r.measurements['volume_cm3'] for r in results]
+        
+        final_width = float(np.median(widths))
+        final_height = float(np.median(heights))
+        final_depth = float(np.median(depths))
+        final_volume = float(np.median(volumes))
+        
+        # Compute std deviation as error estimate
+        width_std = float(np.std(widths))
+        height_std = float(np.std(heights))
+        depth_std = float(np.std(depths))
+        volume_std = float(np.std(volumes))
+        
+        # Average confidence
+        avg_confidence = float(np.mean([r.confidence for r in results]))
+        total_time = sum(r.total_time for r in results)
+        
+        print(f"Width:  {final_width:.2f} ± {width_std:.2f} cm")
+        print(f"Height: {final_height:.2f} ± {height_std:.2f} cm")
+        print(f"Depth:  {final_depth:.2f} ± {depth_std:.2f} cm")
+        print(f"Volume: {final_volume:.2f} ± {volume_std:.2f} cm³")
+        
+        # Overall error percentage
+        avg_dimension = (final_width + final_height + final_depth) / 3
+        avg_std = (width_std + height_std + depth_std) / 3
+        error_percent = (avg_std / avg_dimension * 100) if avg_dimension > 0 else 0
+        
+        print(f"\nMeasurement Repeatability: ±{error_percent:.1f}%")
+        print(f"Average Confidence: {avg_confidence:.1%}")
+        print(f"Total Processing Time: {total_time:.2f}s ({total_time/num_runs:.2f}s per run)")
+        print("=" * 60)
+        
+        # Use last result for saving (but with averaged measurements)
+        result = results[-1]
+        result.measurements['width'] = final_width
+        result.measurements['height'] = final_height
+        result.measurements['depth'] = final_depth
+        result.measurements['volume_cm3'] = final_volume
+        result.confidence = avg_confidence
+        
+        # Add repeatability info to error bounds
+        if result.error_bounds is None:
+            result.error_bounds = {}
+        result.error_bounds['width_std'] = width_std
+        result.error_bounds['height_std'] = height_std
+        result.error_bounds['depth_std'] = depth_std
+        result.error_bounds['repeatability_error_percent'] = error_percent
+        result.error_bounds['num_runs'] = num_runs
+        
     else:
-        # Print without error bounds
-        print(f"Width:  {result.measurements['width']:.2f} cm")
-        print(f"Height: {result.measurements['height']:.2f} cm")
-        print(f"Depth:  {result.measurements['depth']:.2f} cm")
-        print(f"Volume: {result.measurements['volume_cm3']:.2f} cm³")
-    
-    print(f"\nConfidence: {result.confidence:.1%}")
-    print(f"Processing Time: {result.total_time:.2f}s")
-    print(f"GPU Time: {result.gpu_time:.2f}s")
-    print("=" * 60)
+        # Single measurement
+        logger.info("Running measurement...")
+        result = system.measure(
+            images=images,
+            image_paths=image_paths,
+            imu_data=imu_data,
+            metadata=metadata
+        )
+        
+        # Print results
+        print("\n" + "=" * 60)
+        print("MEASUREMENT RESULTS")
+        print("=" * 60)
+        
+        if result.error_bounds:
+            # Print with error bounds
+            print(f"Width:  {result.measurements['width']:.2f} ± {result.error_bounds['width_error']:.2f} cm")
+            print(f"Height: {result.measurements['height']:.2f} ± {result.error_bounds['height_error']:.2f} cm")
+            print(f"Depth:  {result.measurements['depth']:.2f} ± {result.error_bounds['depth_error']:.2f} cm")
+            print(f"Volume: {result.measurements['volume_cm3']:.2f} ± {result.error_bounds.get('volume_error', 0):.2f} cm³")
+            print(f"\nEstimated Error: ±{result.error_bounds['relative_error_percent']:.1f}%")
+            print(f"Quality: {result.error_bounds.get('quality', 'N/A')}")
+        else:
+            # Print without error bounds
+            print(f"Width:  {result.measurements['width']:.2f} cm")
+            print(f"Height: {result.measurements['height']:.2f} cm")
+            print(f"Depth:  {result.measurements['depth']:.2f} cm")
+            print(f"Volume: {result.measurements['volume_cm3']:.2f} cm³")
+        
+        print(f"\nConfidence: {result.confidence:.1%}")
+        print(f"Processing Time: {result.total_time:.2f}s")
+        print(f"GPU Time: {result.gpu_time:.2f}s")
+        print("=" * 60)
     
     # Save results
     output_file = config.output_dir / "results.json"
@@ -220,9 +338,13 @@ def main():
     # Measure command
     measure_parser = subparsers.add_parser('measure', help='Measure from images')
     measure_parser.add_argument('images', nargs='+', help='Input image files')
+    measure_parser.add_argument('--config', '-c', help='Path to custom config file (e.g., configs/gtx1650_config.py)')
     measure_parser.add_argument('--imu-data', help='IMU data JSON file')
     measure_parser.add_argument('--metadata', help='Metadata JSON file')
     measure_parser.add_argument('--output', '-o', default='output', help='Output directory')
+    measure_parser.add_argument('--num-runs', '-n', type=int, default=1, 
+                               help='Number of measurement runs for averaging (default: 1, recommended: 3)')
+
     
     # Benchmark command
     benchmark_parser = subparsers.add_parser('benchmark', help='Run performance benchmark')

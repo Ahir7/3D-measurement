@@ -1,47 +1,103 @@
-version: '3.8'
+# Docker Compose for GPU-Accelerated 3D Measurement System
+# Version: 2.0.0
+# 
+# Prerequisites:
+# - Docker 20.10+
+# - docker-compose 1.29+ or Docker Compose V2
+# - NVIDIA Docker runtime (nvidia-docker2)
+# - NVIDIA GPU with CUDA support
+#
+# Usage:
+#   docker-compose -f docker-compose.gpu.yml up -d
+#   docker-compose -f docker-compose.gpu.yml logs -f
+#   docker-compose -f docker-compose.gpu.yml down
 
 services:
   measurement-system:
     build:
       context: .
       dockerfile: Dockerfile.gpu
-    image: 3d-measurement:gpu-v2
+      args:
+        BUILDKIT_INLINE_CACHE: 1
+    
+    image: 3d-measurement:gpu-v2.0
     container_name: 3d-measurement-gpu
     
+    # Port mapping
     ports:
-      - "8000:8000"
+      - "8000:8000"  # API server
     
+    # Environment variables
     environment:
+      # CUDA configuration
       - CUDA_VISIBLE_DEVICES=0
+      - NVIDIA_VISIBLE_DEVICES=0
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      
+      # PyTorch CUDA memory management
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+      
+      # Application settings
       - LOG_LEVEL=INFO
+      - WORKERS=1
+      - MAX_IMAGES=50
+      - MAX_IMAGE_SIZE=2048
+      
+      # GPU optimization
+      - CUDA_LAUNCH_BLOCKING=0
+      - OMP_NUM_THREADS=4
     
+    # Volume mounts
     volumes:
+      # Output directory (results, point clouds)
       - ./output:/app/output
+      
+      # Logs directory
       - ./logs:/app/logs
+      
+      # Data directory (for models cache if needed)
       - ./data:/app/data
+      
+      # Optional: Mount example images for testing
+      # - ./examples:/app/examples:ro
     
+    # GPU access
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              count: 1  # Use 1 GPU (change to "all" for multiple GPUs)
               capabilities: [gpu]
     
+    # Restart policy
     restart: unless-stopped
     
+    # Health check
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 60s  # Give 60s for model loading
     
+    # Networking
     networks:
       - measurement-network
+    
+    # Resource limits (optional, adjust based on your system)
+    # mem_limit: 16g
+    # memswap_limit: 16g
+    # shm_size: 2g
 
 networks:
   measurement-network:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
 
+# Optional: Add volumes for persistent data
+# volumes:
+#   model_cache:
+#     driver: local

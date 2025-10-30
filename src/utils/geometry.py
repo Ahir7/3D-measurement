@@ -173,8 +173,10 @@ def compute_oriented_bbox(points: np.ndarray) -> BoundingBox:
     transformed = centered @ eigenvectors
     
     # Compute dimensions along principal axes
-    mins = transformed.min(axis=0)
-    maxs = transformed.max(axis=0)
+    lower_percentile = np.percentile(transformed, 10.0, axis=0)
+    upper_percentile = np.percentile(transformed, 90.0, axis=0)
+    mins = lower_percentile
+    maxs = upper_percentile
     dimensions = maxs - mins
     
     # Sort dimensions (width >= height >= depth convention)

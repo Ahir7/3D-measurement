@@ -41,22 +41,35 @@ class MarkerDetector:
     
     def __init__(self, device: str = 'cuda:0'):
         """
-        Initialize marker detector.
+        Initialize marker detector with enhanced parameters.
         
         Args:
             device: GPU device identifier
         """
         self.device = torch.device(device) if torch.cuda.is_available() else torch.device('cpu')
         
-        # Initialize ArUco detector
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250)
+        # Initialize multiple ArUco dictionaries for better detection
+        self.aruco_dicts = {
+            'DICT_4X4_50': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50),
+            'DICT_5X5_50': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_50),
+            'DICT_6X6_250': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_6X6_250),
+            'DICT_ARUCO_ORIGINAL': cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_ARUCO_ORIGINAL),
+        }
+        
+        # Enhanced detection parameters with sub-pixel refinement
         self.aruco_params = cv2.aruco.DetectorParameters()
-        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+        self.aruco_params.adaptiveThreshWinSizeMin = 3
+        self.aruco_params.adaptiveThreshWinSizeMax = 23
+        self.aruco_params.adaptiveThreshWinSizeStep = 2
+        self.aruco_params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+        self.aruco_params.cornerRefinementWinSize = 5
+        self.aruco_params.cornerRefinementMaxIterations = 30
+        self.aruco_params.cornerRefinementMinAccuracy = 0.01
         
         # Initialize QR detector
         self.qr_detector = cv2.QRCodeDetector()
         
-        logger.info(f"Marker detector initialized on {self.device}")
+        logger.info(f"Marker detector initialized on {self.device} with {len(self.aruco_dicts)} ArUco dictionaries")
     
     def detect_markers(
         self,
@@ -111,38 +124,48 @@ class MarkerDetector:
         gray: np.ndarray,
         known_sizes: Optional[Dict[int, float]]
     ) -> List[DetectedMarker]:
-        """Detect ArUco markers."""
-        corners, ids, rejected = self.aruco_detector.detectMarkers(gray)
+        """Detect ArUco markers using multiple dictionaries with sub-pixel refinement."""
+        all_markers = []
+        detected_ids = set()  # Avoid duplicates
         
-        markers = []
-        if ids is not None:
-            for i, marker_id in enumerate(ids.flatten()):
-                corner = corners[i][0]  # Shape: (4, 2)
-                center = corner.mean(axis=0)
-                
-                # Estimate size in pixels (perimeter / 4)
-                perimeter = np.linalg.norm(corner[0] - corner[1]) + \
-                           np.linalg.norm(corner[1] - corner[2]) + \
-                           np.linalg.norm(corner[2] - corner[3]) + \
-                           np.linalg.norm(corner[3] - corner[0])
-                size_pixels = perimeter / 4
-                
-                # Get known size if available
-                size_mm = known_sizes.get(int(marker_id), 100.0) if known_sizes else 100.0
-                
-                marker = DetectedMarker(
-                    marker_type=MarkerType.ARUCO,
-                    marker_id=int(marker_id),
-                    corners=corner,
-                    center=(float(center[0]), float(center[1])),
-                    size_pixels=float(size_pixels),
-                    size_mm=size_mm,
-                    confidence=0.9  # ArUco markers have high confidence
-                )
-                markers.append(marker)
-                logger.debug(f"Detected ArUco marker ID={marker_id} at {center}")
+        # Try each dictionary
+        for dict_name, aruco_dict in self.aruco_dicts.items():
+            detector = cv2.aruco.ArucoDetector(aruco_dict, self.aruco_params)
+            corners, ids, rejected = detector.detectMarkers(gray)
+            
+            if ids is not None:
+                for i, marker_id in enumerate(ids.flatten()):
+                    # Skip if already detected by another dictionary
+                    if marker_id in detected_ids:
+                        continue
+                    
+                    detected_ids.add(marker_id)
+                    corner = corners[i][0]  # Shape: (4, 2)
+                    center = corner.mean(axis=0)
+                    
+                    # Estimate size in pixels (perimeter / 4)
+                    perimeter = np.linalg.norm(corner[0] - corner[1]) + \
+                               np.linalg.norm(corner[1] - corner[2]) + \
+                               np.linalg.norm(corner[2] - corner[3]) + \
+                               np.linalg.norm(corner[3] - corner[0])
+                    size_pixels = perimeter / 4
+                    
+                    # Get known size if available
+                    size_mm = known_sizes.get(int(marker_id), 100.0) if known_sizes else 100.0
+                    
+                    marker = DetectedMarker(
+                        marker_type=MarkerType.ARUCO,
+                        marker_id=int(marker_id),
+                        corners=corner,
+                        center=(float(center[0]), float(center[1])),
+                        size_pixels=float(size_pixels),
+                        size_mm=size_mm,
+                        confidence=0.95  # High confidence with sub-pixel refinement
+                    )
+                    all_markers.append(marker)
+                    logger.debug(f"Detected ArUco marker ID={marker_id} at {center} with {dict_name}")
         
-        return markers
+        return all_markers
     
     def _detect_qr(
         self,
