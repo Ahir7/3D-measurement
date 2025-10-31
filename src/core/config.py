@@ -85,7 +85,7 @@ class Metric3DConfig:
     use_tensorrt: bool = False
     
     # Depth processing
-    depth_scale_factor: float = 1.0  # Keep 1.0; apply post-scale calibration instead
+    depth_scale_factor: float = 0.2214  # Keep 1.0; apply post-scale calibration instead
     min_depth: float = 0.1  # meters
     max_depth: float = 100.0  # meters
     

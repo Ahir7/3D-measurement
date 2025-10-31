@@ -57,7 +57,7 @@ def get_rtx2060_config() -> SystemConfig:
             use_mixed_precision=True,
             compile_model=False,  # Disabled due to 10+ min compilation time
             use_tensorrt=False,
-            depth_scale_factor=1.0,
+            depth_scale_factor=0.2214,
             min_depth=0.1,
             max_depth=100.0,
             near_depth=1.0,  # 1m for typical indoor close objects

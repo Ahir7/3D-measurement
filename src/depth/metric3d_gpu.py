@@ -25,6 +25,48 @@ from ..core.config import Metric3DConfig
 logger = logging.getLogger(__name__)
 
 
+def ensure_bchw(images: torch.Tensor) -> torch.Tensor:
+    """
+    Ensure input tensor is in [B, C, H, W] with C in {1, 3}.
+    Accepts shapes: [H, W], [C, H, W], [B, H, W], [H, W, 3], [B, H, W, 3], [B, C, H, W].
+    Grayscale inputs (C=1) are repeated to RGB (C=3).
+    """
+    if not isinstance(images, torch.Tensor):
+        raise TypeError(f"Expected torch.Tensor, got {type(images)}")
+
+    # Normalize dimensionality
+    if images.dim() == 2:  # [H, W]
+        images = images.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    elif images.dim() == 3:
+        if images.shape[0] in (1, 3):  # [C, H, W]
+            images = images.unsqueeze(0)  # [1, C, H, W]
+        elif images.shape[-1] == 3:  # [H, W, 3]
+            images = images.unsqueeze(0).permute(0, 3, 1, 2)  # [1, 3, H, W]
+        else:  # [B, H, W]
+            images = images.unsqueeze(1)  # [B, 1, H, W]
+    elif images.dim() == 4:
+        if images.shape[-1] == 3:  # [B, H, W, 3]
+            images = images.permute(0, 3, 1, 2)  # [B, 3, H, W]
+        elif images.shape[1] in (1, 3):  # [B, C, H, W]
+            pass
+        else:
+            raise ValueError(f"Cannot infer channel dimension from shape {tuple(images.shape)}")
+    else:
+        raise ValueError(f"Unsupported input dim={images.dim()} shape={tuple(images.shape)}")
+
+    # Ensure 3 channels
+    channels = images.shape[1]
+    if channels == 1:
+        images = images.repeat(1, 3, 1, 1)
+    elif channels == 3:
+        pass
+    elif channels == 4:  # RGBA -> RGB
+        images = images[:, :3, ...]
+    else:
+        raise ValueError(f"Unsupported channel count: {channels}")
+
+    return images
+
 @dataclass
 class DepthEstimation:
     """Depth estimation result."""
@@ -155,11 +197,16 @@ class Metric3DEstimator:
         if self.model is None:
             raise RuntimeError("Model not loaded")
         
+        # Log initial shape
+        try:
+            logger.debug(f"estimate_depth: input shape={tuple(images.shape)} dtype={images.dtype} device={images.device}")
+        except Exception:
+            pass
+
         # Ensure correct format [B, 3, H, W]
-        if images.dim() == 3:
-            images = images.unsqueeze(0)
-        if images.shape[-1] == 3:  # [B, H, W, 3] -> [B, 3, H, W]
-            images = images.permute(0, 3, 1, 2)
+        images = ensure_bchw(images)
+
+        logger.debug(f"estimate_depth: normalized input shape={tuple(images.shape)}")
         
         total_images = images.shape[0]
         logger.info(f"Estimating depth for {total_images} images in batches of {batch_size}")
@@ -186,10 +233,15 @@ class Metric3DEstimator:
                 
                 # Preprocess
                 images_processed = self._preprocess(batch_images)
+                logger.debug(f"estimate_depth: preprocessed batch shape={tuple(images_processed.shape)}")
                 
                 # Run inference
                 with torch.no_grad():
                     depth_maps = self._run_inference(images_processed)
+                    try:
+                        logger.debug(f"estimate_depth: raw depth output shape={tuple(depth_maps.shape)}")
+                    except Exception:
+                        pass
                 
                 # Post-process and collect results
                 for i in range(current_batch_size):
@@ -201,6 +253,7 @@ class Metric3DEstimator:
                         depth_maps[i],
                         target_size=target_size
                     )
+                    logger.debug(f"estimate_depth: postprocessed depth shape={tuple(depth_map.shape)} target={target_size}")
                     
                     confidence_map = None
                     if return_confidence:
@@ -248,6 +301,14 @@ class Metric3DEstimator:
         Returns:
             Preprocessed images
         """
+        # Ensure device and dtype
+        if images.device != self.device:
+            images = images.to(self.device, non_blocking=True)
+        if not torch.is_floating_point(images):
+            images = images.float()
+
+        logger.debug(f"_preprocess: input batch shape={tuple(images.shape)} dtype={images.dtype} device={images.device}")
+
         # Resize to model input size
         target_size = self.config.input_size
         images_resized = F.interpolate(
@@ -266,6 +327,8 @@ class Metric3DEstimator:
         std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
         images_normalized = (images_resized - mean) / std
         
+        logger.debug(f"_preprocess: output batch shape={tuple(images_normalized.shape)}")
+
         return images_normalized
     
     def _run_inference(self, images: torch.Tensor) -> torch.Tensor:
@@ -278,6 +341,7 @@ class Metric3DEstimator:
         Returns:
             Raw depth predictions
         """
+        logger.debug(f"_run_inference: input shape={tuple(images.shape)}")
         if hasattr(self.model, 'forward'):
             outputs = self.model(images)
             if hasattr(outputs, 'predicted_depth'):
@@ -286,7 +350,11 @@ class Metric3DEstimator:
                 depth = outputs
         else:
             depth = self.model(images)
-        
+        try:
+            logger.debug(f"_run_inference: output shape={tuple(depth.shape)}")
+        except Exception:
+            pass
+
         return depth
     
     def _postprocess(
@@ -304,13 +372,13 @@ class Metric3DEstimator:
         Returns:
             Processed depth map in meters
         """
-        # Ensure 2D - handle various output formats
-        while depth.dim() > 2:
-            depth = depth.squeeze(0)
+        # Ensure 2D [H, W]: collapse any leading dims (batch/channel) by averaging
+        if depth.dim() < 2:
+            raise ValueError(f"Expected at least 2D depth map, got shape {depth.shape}")
         
-        # Ensure we have a 2D tensor [H, W]
-        if depth.dim() != 2:
-            raise ValueError(f"Expected 2D depth map, got shape {depth.shape}")
+        h, w = depth.shape[-2], depth.shape[-1]
+        depth = depth.reshape(-1, h, w).mean(dim=0)
+        logger.debug(f"_postprocess: collapsed to 2D shape={tuple(depth.shape)}")
         
         # Resize to target size - add batch and channel dims [1, 1, H, W]
         depth_resized = F.interpolate(

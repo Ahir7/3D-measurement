@@ -15,6 +15,7 @@ dependencies:
   # HTTP client
   http: ^1.1.0
   dio: ^5.3.3
+  http_parser: ^4.0.2
   
   # Camera
   camera: ^0.10.5+5
@@ -25,6 +26,7 @@ dependencies:
   
   # Sensors (for guidance)
   sensors_plus: ^3.1.0
+  geolocator: ^9.0.2
   
   # State management
   provider: ^6.0.5
