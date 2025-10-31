@@ -879,7 +879,7 @@ Future<Map<String, dynamic>> measureObject() async {
 
 ```bash
 # 1. Clone repository
-git clone https://github.com/yourusername/3d-measurement.git
+git clone https://github.com/Ahir7/3d-measurement.git
 cd 3d-measurement
 
 # 2. Create virtual environment
@@ -1253,8 +1253,7 @@ We welcome contributions! Areas of interest:
 
 - **Documentation**: See `/docs` folder
 - **Issues**: GitHub Issues
-- **Email**: support@3dmeasurement.ai
-- **Discord**: [Join our community](https://discord.gg/3dmeasurement)
+- **Email**: harsh@datamace.in
 
 ---
 
