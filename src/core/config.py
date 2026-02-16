@@ -8,8 +8,9 @@ for GPU-accelerated 3D reconstruction and measurement.
 import torch
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
+from enum import Enum
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,113 @@ class GPUConfig:
         return True
 
 
+class DepthModelType(Enum):
+    """Supported depth estimation models."""
+    DPT_LARGE = "dpt_large"
+    DEPTH_PRO = "depth_pro"
+    DEPTH_ANYTHING_V2 = "depth_anything_v2"
+    MIDAS_V3 = "midas_v3"
+
+
+class UncertaintyFusionMethod(Enum):
+    """Methods for fusing multiple uncertainty sources."""
+    WEIGHTED_AVERAGE = "weighted_average"
+    MAX = "max"
+    LEARNED = "learned"
+
+
+@dataclass
+class ModelSelectionConfig:
+    """Configuration for multi-model depth estimation."""
+
+    # Primary model selection
+    primary_model: str = "dpt_large"  # dpt_large | depth_pro | depth_anything_v2 | midas_v3
+    fallback_model: Optional[str] = None
+
+    # Model weights directory
+    model_weights_dir: Path = field(default_factory=lambda: Path("models/depth"))
+
+    # Fine-tuning options
+    enable_fine_tuning: bool = False
+    fine_tune_head_only: bool = True  # Only fine-tune prediction head
+    fine_tune_checkpoint: Optional[Path] = None
+
+    # Model-specific settings
+    depth_anything_variant: str = "vitl"  # vits | vitb | vitl | vitg
+    midas_variant: str = "dpt_beit_large_512"  # dpt_beit_large_512 | dpt_swin2_large_384
+
+    def __post_init__(self):
+        if isinstance(self.model_weights_dir, str):
+            self.model_weights_dir = Path(self.model_weights_dir)
+        if self.fine_tune_checkpoint and isinstance(self.fine_tune_checkpoint, str):
+            self.fine_tune_checkpoint = Path(self.fine_tune_checkpoint)
+
+
+@dataclass
+class UncertaintyConfig:
+    """Configuration for depth uncertainty estimation."""
+
+    # Monte Carlo Dropout
+    enable_mc_dropout: bool = True
+    mc_dropout_passes: int = 10  # Conservative for 6GB GPUs
+    dropout_rate: float = 0.1
+
+    # Ensemble (disabled by default - memory intensive)
+    enable_ensemble: bool = False
+    ensemble_size: int = 5
+    ensemble_models: List[str] = field(default_factory=list)
+
+    # Flip consistency
+    enable_flip_consistency: bool = True
+
+    # Uncertainty fusion
+    fusion_method: str = "weighted_average"  # weighted_average | max | learned
+
+    # Uncertainty-based filtering
+    uncertainty_threshold: float = 0.5  # Reject points with uncertainty > threshold
+    enable_uncertainty_weighting: bool = True  # Weight points by inverse uncertainty
+
+    # Calibration
+    enable_uncertainty_calibration: bool = False
+    calibration_data_path: Optional[Path] = None
+
+    def __post_init__(self):
+        if self.calibration_data_path and isinstance(self.calibration_data_path, str):
+            self.calibration_data_path = Path(self.calibration_data_path)
+
+
+@dataclass
+class GeometricPriorsConfig:
+    """Configuration for geometric prior constraints."""
+
+    # Rectangular prism fitting
+    enable_prism_fitting: bool = True
+    prism_fitting_iterations: int = 100
+    prism_inlier_threshold: float = 0.02  # meters
+
+    # Plane detection (RANSAC)
+    enable_plane_detection: bool = True
+    ransac_iterations: int = 1000
+    ransac_threshold: float = 0.01  # meters
+    min_plane_points: int = 50
+    max_planes: int = 6  # Maximum number of planes to detect
+
+    # Box topology validation
+    enable_box_topology: bool = True
+    orthogonality_tolerance_degrees: float = 5.0
+    parallelism_tolerance_degrees: float = 5.0
+
+    # Epipolar consistency (multi-view)
+    enable_epipolar_check: bool = True
+    epipolar_threshold: float = 2.0  # pixels
+    min_epipolar_inliers: int = 50
+
+    # Refinement options
+    enable_geometric_refinement: bool = True
+    refinement_iterations: int = 50
+    refinement_learning_rate: float = 0.01
+
+
 @dataclass
 class COLMAPConfig:
     """COLMAP reconstruction configuration."""
@@ -74,24 +182,31 @@ class COLMAPConfig:
 @dataclass
 class Metric3DConfig:
     """Metric3D depth estimation configuration."""
-    
+
     model_name: str = "metric3d_vit_large"
     input_size: Tuple[int, int] = (518, 518)
     max_input_size: Tuple[int, int] = (2160, 2880)  # 6MP max for 6GB GPUs
-    
+
     # Inference settings
     use_mixed_precision: bool = True
     compile_model: bool = False  # Disabled: 10+ min first-time compilation
     use_tensorrt: bool = False
-    
+
     # Depth processing
-    depth_scale_factor: float = 0.2214  # Keep 1.0; apply post-scale calibration instead
+    depth_scale_factor: float = 1.0  # Keep at 1.0; use depth_only_calibration for post-scale correction
     min_depth: float = 0.1  # meters
     max_depth: float = 100.0  # meters
-    
+    depth_normalization_mode: str = "global_percentile"  # global_percentile | per_image_percentile | none
+    percentile_low: float = 0.01
+    percentile_high: float = 0.99
+
     # Depth normalization range (for indoor scenes)
     near_depth: float = 1.0  # meters - closest expected objects
     far_depth: float = 8.0   # meters - farthest expected objects
+
+    # Model selection and uncertainty (new for accuracy enhancement)
+    model_selection: ModelSelectionConfig = field(default_factory=ModelSelectionConfig)
+    uncertainty: UncertaintyConfig = field(default_factory=UncertaintyConfig)
 
 
 @dataclass
@@ -115,6 +230,12 @@ class ScaleRecoveryConfig:
     # Confidence thresholds - depth-only accepts any estimate
     min_confidence: float = 0.0
     min_methods_required: int = 1  # Allow single method if confidence > threshold
+    low_confidence_threshold: float = 0.35
+
+    # Depth-aligned fusion robustness
+    depth_aligned_min_views: int = 3
+    depth_confidence_min: float = 0.35
+    depth_confidence_weight_power: float = 1.25
     
     # Depth-only mode calibration
     # This corrects the absolute scale after depth-based scale recovery
@@ -128,18 +249,28 @@ class ScaleRecoveryConfig:
 @dataclass
 class SystemConfig:
     """Complete system configuration with validation."""
-    
+
     # Sub-configurations
     gpu: GPUConfig = field(default_factory=GPUConfig)
     colmap: COLMAPConfig = field(default_factory=COLMAPConfig)
     metric3d: Metric3DConfig = field(default_factory=Metric3DConfig)
     scale_recovery: ScaleRecoveryConfig = field(default_factory=ScaleRecoveryConfig)
+    geometric_priors: GeometricPriorsConfig = field(default_factory=GeometricPriorsConfig)
     
     # Processing settings - Optimized for RTX 2060 6GB
     batch_size: int = 3  # 3x increase for 6GB GPUs
     max_image_size: int = 2048
     min_images: int = 3
     max_images: int = 50
+
+    # Accuracy settings (image-only quality prefilter)
+    enable_capture_quality_filter: bool = True
+    capture_quality_threshold: float = 0.45
+    quality_drop_fraction: float = 0.20
+    enable_adaptive_quality_drop: bool = True
+    adaptive_quality_drop_min: float = 0.10
+    adaptive_quality_drop_max: float = 0.35
+    min_images_after_quality_filter: int = 10
     
     # Output settings
     output_dir: Path = field(default_factory=lambda: Path("output"))
@@ -189,6 +320,28 @@ class SystemConfig:
         
         if self.max_image_size < 512:
             raise ValueError("max_image_size must be at least 512")
+
+        # Validate quality prefilter settings
+        if not (0.0 <= self.capture_quality_threshold <= 1.0):
+            raise ValueError("capture_quality_threshold must be in [0, 1]")
+        if not (0.0 <= self.quality_drop_fraction <= 0.7):
+            raise ValueError("quality_drop_fraction must be in [0, 0.7]")
+        if not (0.0 <= self.adaptive_quality_drop_min <= self.adaptive_quality_drop_max <= 0.7):
+            raise ValueError("adaptive_quality_drop_min/max must satisfy 0 <= min <= max <= 0.7")
+        if self.min_images_after_quality_filter < self.min_images:
+            raise ValueError("min_images_after_quality_filter must be >= min_images")
+
+        # Validate depth normalization settings
+        valid_norm_modes = {"global_percentile", "per_image_percentile", "none"}
+        if self.metric3d.depth_normalization_mode not in valid_norm_modes:
+            raise ValueError(
+                f"Invalid depth_normalization_mode: {self.metric3d.depth_normalization_mode}. "
+                f"Expected one of {sorted(valid_norm_modes)}"
+            )
+        if not (0.0 <= self.metric3d.percentile_low < self.metric3d.percentile_high <= 1.0):
+            raise ValueError(
+                "percentile_low/percentile_high must satisfy 0 <= low < high <= 1"
+            )
         
         # Validate scale recovery weights
         total_weight = (
@@ -201,6 +354,27 @@ class SystemConfig:
             raise ValueError(
                 f"Scale recovery weights must sum to 1.0, got {total_weight}"
             )
+
+        if not (0.0 <= self.scale_recovery.depth_confidence_min <= 1.0):
+            raise ValueError("depth_confidence_min must be in [0, 1]")
+        if not (0.5 <= self.scale_recovery.depth_confidence_weight_power <= 3.0):
+            raise ValueError("depth_confidence_weight_power must be in [0.5, 3.0]")
+
+        # Validate uncertainty configuration
+        if self.metric3d.uncertainty.mc_dropout_passes < 1:
+            raise ValueError("mc_dropout_passes must be at least 1")
+        if not (0.0 <= self.metric3d.uncertainty.dropout_rate <= 0.5):
+            raise ValueError("dropout_rate must be in [0, 0.5]")
+        if self.metric3d.uncertainty.fusion_method not in {"weighted_average", "max", "learned"}:
+            raise ValueError("fusion_method must be 'weighted_average', 'max', or 'learned'")
+
+        # Validate geometric priors configuration
+        if self.geometric_priors.ransac_iterations < 10:
+            raise ValueError("ransac_iterations must be at least 10")
+        if not (0.0 < self.geometric_priors.ransac_threshold <= 0.1):
+            raise ValueError("ransac_threshold must be in (0, 0.1]")
+        if not (0.0 < self.geometric_priors.orthogonality_tolerance_degrees <= 15.0):
+            raise ValueError("orthogonality_tolerance_degrees must be in (0, 15]")
         
         # Create output directory
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -211,7 +385,7 @@ class SystemConfig:
     def to_dict(self) -> Dict:
         """
         Convert configuration to dictionary.
-        
+
         Returns:
             Dictionary representation of configuration
         """
@@ -227,13 +401,30 @@ class SystemConfig:
             },
             'metric3d': {
                 'model_name': self.metric3d.model_name,
-                'input_size': self.metric3d.input_size
+                'input_size': self.metric3d.input_size,
+                'model_selection': {
+                    'primary_model': self.metric3d.model_selection.primary_model,
+                    'fallback_model': self.metric3d.model_selection.fallback_model,
+                    'enable_fine_tuning': self.metric3d.model_selection.enable_fine_tuning
+                },
+                'uncertainty': {
+                    'enable_mc_dropout': self.metric3d.uncertainty.enable_mc_dropout,
+                    'mc_dropout_passes': self.metric3d.uncertainty.mc_dropout_passes,
+                    'enable_flip_consistency': self.metric3d.uncertainty.enable_flip_consistency,
+                    'fusion_method': self.metric3d.uncertainty.fusion_method
+                }
             },
             'scale_recovery': {
                 'marker_weight': self.scale_recovery.marker_weight,
                 'imu_weight': self.scale_recovery.imu_weight,
                 'depth_weight': self.scale_recovery.depth_weight,
                 'object_weight': self.scale_recovery.object_weight
+            },
+            'geometric_priors': {
+                'enable_prism_fitting': self.geometric_priors.enable_prism_fitting,
+                'enable_plane_detection': self.geometric_priors.enable_plane_detection,
+                'enable_epipolar_check': self.geometric_priors.enable_epipolar_check,
+                'enable_geometric_refinement': self.geometric_priors.enable_geometric_refinement
             },
             'processing': {
                 'batch_size': self.batch_size,
@@ -247,25 +438,41 @@ class SystemConfig:
     def from_dict(cls, config_dict: Dict) -> 'SystemConfig':
         """
         Create configuration from dictionary.
-        
+
         Args:
             config_dict: Dictionary with configuration values
-            
+
         Returns:
             SystemConfig instance
         """
         gpu_config = GPUConfig(**config_dict.get('gpu', {}))
         colmap_config = COLMAPConfig(**config_dict.get('colmap', {}))
-        metric3d_config = Metric3DConfig(**config_dict.get('metric3d', {}))
+
+        # Handle nested metric3d config
+        metric3d_dict = config_dict.get('metric3d', {})
+        model_selection_dict = metric3d_dict.pop('model_selection', {})
+        uncertainty_dict = metric3d_dict.pop('uncertainty', {})
+
+        model_selection_config = ModelSelectionConfig(**model_selection_dict)
+        uncertainty_config = UncertaintyConfig(**uncertainty_dict)
+
+        metric3d_config = Metric3DConfig(
+            **metric3d_dict,
+            model_selection=model_selection_config,
+            uncertainty=uncertainty_config
+        )
+
         scale_config = ScaleRecoveryConfig(**config_dict.get('scale_recovery', {}))
-        
+        geometric_priors_config = GeometricPriorsConfig(**config_dict.get('geometric_priors', {}))
+
         processing = config_dict.get('processing', {})
-        
+
         return cls(
             gpu=gpu_config,
             colmap=colmap_config,
             metric3d=metric3d_config,
             scale_recovery=scale_config,
+            geometric_priors=geometric_priors_config,
             batch_size=processing.get('batch_size', 1),
             max_image_size=processing.get('max_image_size', 2048),
             min_images=processing.get('min_images', 3),

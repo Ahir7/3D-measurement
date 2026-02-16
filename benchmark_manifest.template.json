@@ -1,0 +1,35 @@
+[
+  {
+    "name": "scene_box_daylight",
+    "images_glob": "examples/benchmark/scene_box_daylight/*.jpg",
+    "ground_truth_cm": {
+      "width": 21.0,
+      "height": 15.0,
+      "depth": 7.8
+    },
+    "config": "configs/enhanced_accuracy_config.py",
+    "notes": "Standard daylight box measurement"
+  },
+  {
+    "name": "scene_box_angle_variation",
+    "images_glob": "examples/benchmark/scene_box_angle_variation/*.jpg",
+    "ground_truth_cm": {
+      "width": 21.0,
+      "height": 15.0,
+      "depth": 7.8
+    },
+    "config": "configs/enhanced_accuracy_config.py",
+    "notes": "Box captured from multiple angles"
+  },
+  {
+    "name": "scene_package_indoor",
+    "images_glob": "examples/benchmark/scene_package_indoor/*.jpg",
+    "ground_truth_cm": {
+      "width": 32.5,
+      "height": 24.0,
+      "depth": 12.0
+    },
+    "config": "configs/enhanced_accuracy_config.py",
+    "notes": "Indoor package measurement"
+  }
+]

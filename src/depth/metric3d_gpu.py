@@ -20,7 +20,7 @@ except ImportError:
     TRANSFORMERS_AVAILABLE = False
     logging.warning("transformers library not available")
 
-from ..core.config import Metric3DConfig
+from ..core.config import Metric3DConfig, UncertaintyConfig
 
 logger = logging.getLogger(__name__)
 
@@ -69,23 +69,68 @@ def ensure_bchw(images: torch.Tensor) -> torch.Tensor:
 
 @dataclass
 class DepthEstimation:
-    """Depth estimation result."""
-    
+    """Depth estimation result with uncertainty quantification."""
+
     depth_map: torch.Tensor  # Depth in meters [H, W]
     confidence_map: Optional[torch.Tensor] = None  # Confidence scores [H, W]
+
+    # Uncertainty fields (new for accuracy enhancement)
+    uncertainty_map: Optional[torch.Tensor] = None  # Combined uncertainty [H, W]
+    mc_variance: Optional[torch.Tensor] = None  # MC Dropout variance [H, W]
+    flip_consistency: Optional[torch.Tensor] = None  # Flip consistency score [H, W]
+
+    # Model identification
+    model_name: str = "dpt_large"  # Model identifier
+
     scale_factor: float = 1.0
     processing_time: float = 0.0
-    
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
-        return {
+        result = {
             'shape': list(self.depth_map.shape),
             'min_depth': float(self.depth_map.min()),
             'max_depth': float(self.depth_map.max()),
             'mean_depth': float(self.depth_map.mean()),
             'scale_factor': self.scale_factor,
-            'processing_time': self.processing_time
+            'processing_time': self.processing_time,
+            'model_name': self.model_name
         }
+
+        # Add uncertainty statistics if available
+        if self.uncertainty_map is not None:
+            result['uncertainty_stats'] = {
+                'mean': float(self.uncertainty_map.mean()),
+                'max': float(self.uncertainty_map.max()),
+                'min': float(self.uncertainty_map.min())
+            }
+
+        if self.mc_variance is not None:
+            result['mc_variance_mean'] = float(self.mc_variance.mean())
+
+        if self.flip_consistency is not None:
+            result['flip_consistency_mean'] = float(self.flip_consistency.mean())
+
+        return result
+
+    def get_weighted_confidence(self) -> torch.Tensor:
+        """
+        Get confidence weighted by uncertainty.
+
+        Returns:
+            Confidence map combining base confidence and uncertainty
+        """
+        if self.confidence_map is None:
+            base_conf = torch.ones_like(self.depth_map)
+        else:
+            base_conf = self.confidence_map
+
+        if self.uncertainty_map is not None:
+            # Convert uncertainty to confidence weight
+            uncertainty_weight = torch.exp(-self.uncertainty_map)
+            return base_conf * uncertainty_weight
+
+        return base_conf
 
 
 class Metric3DEstimator:
@@ -220,15 +265,16 @@ class Metric3DEstimator:
         start_time.record()
         
         try:
-            all_results = []
+            raw_depth_maps = []
             
             # Process images in batches
             for batch_idx in range(0, total_images, batch_size):
+                batch_number = (batch_idx // batch_size) + 1
                 batch_end = min(batch_idx + batch_size, total_images)
                 batch_images = images[batch_idx:batch_end]
                 current_batch_size = batch_images.shape[0]
                 
-                logger.debug(f"Processing batch {batch_idx//batch_size + 1}/{(total_images + batch_size - 1)//batch_size} "
+                logger.debug(f"Processing batch {batch_number}/{(total_images + batch_size - 1)//batch_size} "
                            f"({current_batch_size} images)")
                 
                 # Preprocess
@@ -242,33 +288,48 @@ class Metric3DEstimator:
                         logger.debug(f"estimate_depth: raw depth output shape={tuple(depth_maps.shape)}")
                     except Exception:
                         pass
-                
-                # Post-process and collect results
+
+                # Normalize output shape to [B, H, W]
+                if depth_maps.dim() == 4 and depth_maps.shape[1] == 1:
+                    depth_maps = depth_maps[:, 0, :, :]
+                elif depth_maps.dim() > 3:
+                    depth_maps = depth_maps.reshape(depth_maps.shape[0], depth_maps.shape[-2], depth_maps.shape[-1])
+
+                # Keep raw depth maps to compute global normalization stats
                 for i in range(current_batch_size):
-                    # Get original size for this specific image
-                    img_idx = batch_idx + i
-                    target_size = original_sizes[img_idx]
-                    
-                    depth_map = self._postprocess(
-                        depth_maps[i],
-                        target_size=target_size
-                    )
-                    logger.debug(f"estimate_depth: postprocessed depth shape={tuple(depth_map.shape)} target={target_size}")
-                    
-                    confidence_map = None
-                    if return_confidence:
-                        confidence_map = self._compute_confidence(depth_map)
-                    
-                    all_results.append(DepthEstimation(
-                        depth_map=depth_map,
-                        confidence_map=confidence_map,
-                        scale_factor=1.0
-                    ))
+                    raw_depth_maps.append(depth_maps[i].detach().to('cpu', dtype=torch.float32))
                 
                 # Clear GPU memory after each batch
                 del images_processed, depth_maps
-                torch.cuda.empty_cache()
-                logger.debug(f"Batch {batch_idx//batch_size + 1} complete, GPU memory freed")
+                if batch_number % 4 == 0:
+                    torch.cuda.empty_cache()
+                    logger.debug(f"Batch {batch_number} complete, periodic cache cleanup")
+
+            # Build normalization stats once for the full image set
+            normalization_stats = self._compute_global_normalization_stats(raw_depth_maps)
+
+            # Post-process in original order
+            all_results = []
+            for img_idx, raw_depth in enumerate(raw_depth_maps):
+                target_size = original_sizes[img_idx]
+
+                depth_map = self._postprocess(
+                    raw_depth.to(self.device, non_blocking=True),
+                    target_size=target_size,
+                    normalization_stats=normalization_stats
+                )
+                logger.debug(f"estimate_depth: postprocessed depth shape={tuple(depth_map.shape)} target={target_size}")
+
+                confidence_map = None
+                if return_confidence:
+                    confidence_map = self._compute_confidence(depth_map)
+
+                all_results.append(DepthEstimation(
+                    depth_map=depth_map,
+                    confidence_map=confidence_map,
+                    model_name=self.config.model_name,
+                    scale_factor=1.0
+                ))
             
             # Record timing
             end_time.record()
@@ -287,8 +348,8 @@ class Metric3DEstimator:
             raise RuntimeError(f"Depth estimation failed: {e}")
         
         finally:
-            # Clear cache
-            if batch_size > 1:
+            # Periodic final cache cleanup only for larger jobs
+            if total_images >= 12:
                 torch.cuda.empty_cache()
     
     def _preprocess(self, images: torch.Tensor) -> torch.Tensor:
@@ -360,7 +421,8 @@ class Metric3DEstimator:
     def _postprocess(
         self,
         depth: torch.Tensor,
-        target_size: Tuple[int, int]
+        target_size: Tuple[int, int],
+        normalization_stats: Optional[Dict[str, float]] = None
     ) -> torch.Tensor:
         """
         Post-process depth map.
@@ -389,7 +451,7 @@ class Metric3DEstimator:
         ).squeeze()  # Remove batch and channel dims back to [H, W]
         
         # Normalize to metric scale
-        depth_normalized = self._normalize_depth(depth_resized)
+        depth_normalized = self._normalize_depth(depth_resized, normalization_stats=normalization_stats)
         
         # Clip to valid range
         depth_clipped = torch.clamp(
@@ -400,7 +462,11 @@ class Metric3DEstimator:
         
         return depth_clipped
     
-    def _normalize_depth(self, depth: torch.Tensor) -> torch.Tensor:
+    def _normalize_depth(
+        self,
+        depth: torch.Tensor,
+        normalization_stats: Optional[Dict[str, float]] = None
+    ) -> torch.Tensor:
         """
         Normalize DPT-Large depth to metric scale.
         
@@ -414,16 +480,27 @@ class Metric3DEstimator:
         Returns:
             Depth in meters
         """
-        # Use percentile-based normalization (more robust than min/max)
-        p1, p99 = torch.quantile(depth, torch.tensor([0.01, 0.99], device=depth.device))
-        
-        # Normalize to [0, 1] using percentiles
-        depth_norm = (depth - p1) / (p99 - p1 + 1e-6)
-        depth_norm = torch.clamp(depth_norm, 0, 1)
-        
-        # DPT-Large calibration for typical indoor scenes
-        # Use configurable depth range (default: 1-8m for indoor)
-        depth_metric = depth_norm * (self.config.far_depth - self.config.near_depth) + self.config.near_depth
+        mode = getattr(self.config, 'depth_normalization_mode', 'global_percentile')
+
+        if mode == 'none':
+            depth_metric = depth
+        else:
+            if mode == 'global_percentile' and normalization_stats is not None:
+                p_low = torch.tensor(normalization_stats['p_low'], device=depth.device, dtype=depth.dtype)
+                p_high = torch.tensor(normalization_stats['p_high'], device=depth.device, dtype=depth.dtype)
+            else:
+                if mode == 'global_percentile':
+                    logger.warning("Global depth normalization selected but stats unavailable; falling back to per-image percentiles")
+                q = torch.tensor(
+                    [self.config.percentile_low, self.config.percentile_high],
+                    device=depth.device,
+                    dtype=depth.dtype
+                )
+                p_low, p_high = torch.quantile(depth, q)
+
+            denom = torch.clamp(p_high - p_low, min=1e-6)
+            depth_norm = torch.clamp((depth - p_low) / denom, 0, 1)
+            depth_metric = depth_norm * (self.config.far_depth - self.config.near_depth) + self.config.near_depth
         
         # Final clipping to physically reasonable range
         depth_metric = torch.clamp(
@@ -433,6 +510,44 @@ class Metric3DEstimator:
         )
         
         return depth_metric * self.config.depth_scale_factor
+
+    def _compute_global_normalization_stats(
+        self,
+        raw_depth_maps: List[torch.Tensor]
+    ) -> Optional[Dict[str, float]]:
+        """Compute robust global percentile stats across the full image set."""
+        if self.config.depth_normalization_mode != 'global_percentile':
+            return None
+
+        sampled_values = []
+        max_samples_per_map = 20000
+
+        for depth in raw_depth_maps:
+            valid = depth[torch.isfinite(depth)]
+            if valid.numel() == 0:
+                continue
+
+            if valid.numel() > max_samples_per_map:
+                indices = torch.randperm(valid.numel())[:max_samples_per_map]
+                valid = valid[indices]
+            sampled_values.append(valid)
+
+        if not sampled_values:
+            return None
+
+        all_values = torch.cat(sampled_values)
+        q = torch.tensor([self.config.percentile_low, self.config.percentile_high], dtype=all_values.dtype)
+        p_low, p_high = torch.quantile(all_values, q)
+
+        stats = {
+            'p_low': float(p_low.item()),
+            'p_high': float(p_high.item())
+        }
+        logger.info(
+            f"Global depth normalization stats: p_low={stats['p_low']:.4f}, "
+            f"p_high={stats['p_high']:.4f}"
+        )
+        return stats
     
     def _compute_confidence(self, depth_map: torch.Tensor) -> torch.Tensor:
         """
@@ -489,7 +604,150 @@ class Metric3DEstimator:
             all_results.extend(results)
         
         return all_results
-    
+
+    @torch.amp.autocast(device_type='cuda', enabled=True)
+    def estimate_with_uncertainty(
+        self,
+        images: torch.Tensor,
+        batch_size: int = 3
+    ) -> List[DepthEstimation]:
+        """
+        Estimate depth with uncertainty quantification.
+
+        Runs MC Dropout and flip consistency to compute uncertainty maps
+        in addition to depth estimates.
+
+        Args:
+            images: Input images tensor [B, 3, H, W] or [B, H, W, 3]
+            batch_size: Number of images to process at once
+
+        Returns:
+            List of DepthEstimation objects with uncertainty fields populated
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        # Get uncertainty config
+        uncertainty_config = getattr(self.config, 'uncertainty', None)
+        if uncertainty_config is None:
+            # Fallback to standard estimation
+            return self.estimate_depth(images, return_confidence=True, batch_size=batch_size)
+
+        # Import uncertainty module
+        from .uncertainty import DepthUncertaintyEstimator
+
+        # Ensure correct format
+        images = ensure_bchw(images)
+
+        total_images = images.shape[0]
+        logger.info(f"Estimating depth with uncertainty for {total_images} images")
+
+        # First get base depth estimates
+        base_results = self.estimate_depth(images, return_confidence=True, batch_size=batch_size)
+
+        # Initialize uncertainty estimator
+        uncertainty_estimator = DepthUncertaintyEstimator(uncertainty_config)
+
+        # Compute uncertainty for each image
+        for i, result in enumerate(base_results):
+            img_batch = images[i:i+1]
+
+            try:
+                uncertainty_estimate = uncertainty_estimator.estimate(
+                    img_batch,
+                    self.model,
+                    depth_maps=result.depth_map.unsqueeze(0),
+                    inference_fn=lambda x: self._run_inference(self._preprocess(x))
+                )
+
+                # Populate uncertainty fields
+                result.uncertainty_map = uncertainty_estimate.combined_uncertainty
+                result.mc_variance = uncertainty_estimate.mc_variance
+                result.flip_consistency = uncertainty_estimate.flip_consistency
+
+            except Exception as e:
+                logger.warning(f"Uncertainty estimation failed for image {i}: {e}")
+                # Keep result without uncertainty
+
+        return base_results
+
+    def _compute_mc_dropout_uncertainty(
+        self,
+        images: torch.Tensor,
+        n_passes: int = 10
+    ) -> torch.Tensor:
+        """
+        Run N forward passes with dropout enabled for MC Dropout uncertainty.
+
+        Args:
+            images: Preprocessed images [B, C, H, W]
+            n_passes: Number of forward passes
+
+        Returns:
+            Variance tensor [B, H, W]
+        """
+        if self.model is None:
+            raise RuntimeError("Model not loaded")
+
+        # Enable dropout
+        self.model.train()
+        for module in self.model.modules():
+            if not isinstance(module, torch.nn.Dropout):
+                module.eval()
+
+        predictions = []
+        with torch.no_grad():
+            for _ in range(n_passes):
+                depth = self._run_inference(images)
+                if depth.dim() == 4:
+                    depth = depth.squeeze(1)
+                predictions.append(depth)
+
+        # Restore eval mode
+        self.model.eval()
+
+        # Stack and compute variance
+        predictions = torch.stack(predictions, dim=0)
+        variance = predictions.var(dim=0)
+
+        return variance
+
+    def _compute_flip_consistency(
+        self,
+        images: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute depth consistency under horizontal flip.
+
+        Args:
+            images: Input images [B, C, H, W]
+
+        Returns:
+            Inconsistency map [B, H, W] (higher = more uncertain)
+        """
+        with torch.no_grad():
+            # Original prediction
+            images_processed = self._preprocess(images)
+            depth_original = self._run_inference(images_processed)
+            if depth_original.dim() == 4:
+                depth_original = depth_original.squeeze(1)
+
+            # Flipped prediction
+            images_flipped = torch.flip(images, dims=[3])
+            images_flipped_processed = self._preprocess(images_flipped)
+            depth_flipped = self._run_inference(images_flipped_processed)
+            if depth_flipped.dim() == 4:
+                depth_flipped = depth_flipped.squeeze(1)
+
+            # Flip back
+            depth_flipped_back = torch.flip(depth_flipped, dims=[2])
+
+            # Compute normalized difference
+            depth_range = depth_original.max() - depth_original.min() + 1e-6
+            inconsistency = torch.abs(depth_original - depth_flipped_back) / depth_range
+
+        return inconsistency
+
     def save_depth_map(
         self,
         depth_estimation: DepthEstimation,

@@ -44,6 +44,23 @@ def print_info(message: str):
     print(f"[INFO] {message}")
 
 
+def _gpu_name(gpu_info: dict) -> str:
+    """Get GPU name from either old or current response keys."""
+    return gpu_info.get('device_name') or gpu_info.get('name') or 'Unknown'
+
+
+def _gpu_free_memory(gpu_info: dict):
+    """Get free memory if present, otherwise derive from total-reserved."""
+    if 'free_memory_gb' in gpu_info:
+        return gpu_info.get('free_memory_gb')
+
+    total = gpu_info.get('total_memory_gb')
+    reserved = gpu_info.get('reserved_memory_gb')
+    if isinstance(total, (int, float)) and isinstance(reserved, (int, float)):
+        return max(total - reserved, 0.0)
+    return None
+
+
 def test_root():
     """Test root endpoint."""
     print_section("Testing Root Endpoint")
@@ -88,10 +105,12 @@ def test_health():
             
             gpu_info = data.get('gpu_info', {})
             if gpu_info.get('available'):
-                print_info(f"GPU Device: {gpu_info.get('device_name')}")
+                print_info(f"GPU Device: {_gpu_name(gpu_info)}")
                 print_info(f"CUDA Version: {gpu_info.get('cuda_version')}")
                 print_info(f"GPU Memory: {gpu_info.get('total_memory_gb'):.2f} GB")
-                print_info(f"Free Memory: {gpu_info.get('free_memory_gb'):.2f} GB")
+                free_gb = _gpu_free_memory(gpu_info)
+                if free_gb is not None:
+                    print_info(f"Free Memory: {free_gb:.2f} GB")
             
             if data.get('system_ready'):
                 print_success("System is READY for measurements")
@@ -122,11 +141,13 @@ def test_gpu_stats():
             
             stats = data.get('gpu_stats', {})
             if stats.get('available'):
-                print_info(f"Device: {stats.get('device_name')}")
+                print_info(f"Device: {_gpu_name(stats)}")
                 print_info(f"Total Memory: {stats.get('total_memory_gb'):.2f} GB")
                 print_info(f"Allocated: {stats.get('allocated_memory_gb'):.2f} GB")
                 print_info(f"Reserved: {stats.get('reserved_memory_gb'):.2f} GB")
-                print_info(f"Free: {stats.get('free_memory_gb'):.2f} GB")
+                free_gb = _gpu_free_memory(stats)
+                if free_gb is not None:
+                    print_info(f"Free: {free_gb:.2f} GB")
             else:
                 print_error("GPU not available")
             
@@ -183,7 +204,8 @@ def test_measure(image_paths: List[str]):
             
             # Display confidence
             confidence = data.get('confidence', 0)
-            print(f"Confidence: {confidence:.1f}%")
+            confidence_percent = confidence * 100.0 if confidence <= 1.0 else confidence
+            print(f"Confidence: {confidence_percent:.1f}%")
             print()
             
             # Display timing
@@ -196,14 +218,16 @@ def test_measure(image_paths: List[str]):
             # Display reconstruction stats
             recon = data.get('reconstruction_stats', {})
             print("Reconstruction:")
-            print(f"  Images: {recon.get('num_images', 0)}")
-            print(f"  3D Points: {recon.get('num_3d_points', 0)}")
+            print(f"  Cameras: {recon.get('num_cameras', recon.get('num_images', 0))}")
+            print(f"  3D Points: {recon.get('num_points', recon.get('num_3d_points', 0))}")
             print()
             
             # Display scale recovery
             scale = data.get('scale_recovery', {})
             print("Scale Recovery:")
-            print(f"  Method: {scale.get('method', 'unknown')}")
+            methods = scale.get('methods_used') or []
+            method_display = ', '.join(methods) if methods else scale.get('method', 'unknown')
+            print(f"  Method: {method_display}")
             print(f"  Scale Factor: {scale.get('scale_factor', 0):.4f}")
             print()
             

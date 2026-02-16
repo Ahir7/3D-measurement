@@ -23,14 +23,15 @@ from ..utils.geometry import (
     estimate_measurement_errors,
     compute_point_cloud_quality
 )
+from ..utils.capture_quality import analyze_capture_quality
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class MeasurementResult:
-    """Complete measurement result with GPU metrics."""
-    
+    """Complete measurement result with GPU metrics and uncertainty."""
+
     measurements: Dict[str, float]
     confidence: float
     gpu_time: float
@@ -40,7 +41,13 @@ class MeasurementResult:
     depth_estimations: Optional[List[DepthEstimation]] = None
     pointcloud_path: Optional[str] = None
     error_bounds: Optional[Dict[str, float]] = None
-    
+
+    # New fields for accuracy enhancement
+    uncertainty_bounds: Optional[Dict[str, float]] = None
+    geometric_fit_score: Optional[float] = None
+    plane_detections: Optional[List[Dict]] = None
+    model_used: Optional[str] = None
+
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
         result = {
@@ -55,10 +62,23 @@ class MeasurementResult:
             'reconstruction_stats': self.reconstruction.to_dict(),
             'pointcloud_path': self.pointcloud_path
         }
-        
+
         if self.error_bounds:
             result['error_bounds'] = self.error_bounds
-        
+
+        # Add new accuracy enhancement fields
+        if self.uncertainty_bounds:
+            result['uncertainty_bounds'] = self.uncertainty_bounds
+
+        if self.geometric_fit_score is not None:
+            result['geometric_fit_score'] = self.geometric_fit_score
+
+        if self.plane_detections:
+            result['plane_detections'] = self.plane_detections
+
+        if self.model_used:
+            result['model_used'] = self.model_used
+
         return result
 
 
@@ -86,6 +106,10 @@ class MeasurementSystemGPU:
         
         # Setup GPU optimizations
         setup_gpu_optimizations(self.config.gpu)
+
+        # Cache cleanup policy
+        self._measure_calls = 0
+        self._cache_cleanup_interval = 5
         
         # Initialize components
         self._init_components()
@@ -182,6 +206,11 @@ class MeasurementSystemGPU:
             )
         
         logger.info(f"Starting measurement with {len(images)} images")
+        self._measure_calls += 1
+
+        # Accuracy stage: prefilter low-quality captures when paths are available
+        quality_info = None
+        images, image_paths, quality_info = self._prefilter_low_quality_images(images, image_paths)
         
         # Start timing
         total_start = time.time()
@@ -233,6 +262,10 @@ class MeasurementSystemGPU:
             
             # Convert depth estimations to tensor
             depth_maps = torch.stack([d.depth_map for d in depth_estimations])
+            confidence_maps = torch.stack([
+                d.confidence_map if d.confidence_map is not None else torch.ones_like(d.depth_map)
+                for d in depth_estimations
+            ])
             
             # Scale recovery
             logger.info("Recovering metric scale...")
@@ -247,6 +280,7 @@ class MeasurementSystemGPU:
                 images_gpu,
                 reconstruction_dict,
                 depth_maps=depth_maps,
+                confidence_maps=confidence_maps,
                 imu_data=imu_data,
                 metadata=metadata
             )
@@ -270,6 +304,35 @@ class MeasurementSystemGPU:
                 scale_result.confidence,
                 method='detailed'
             )
+
+            if quality_info is not None:
+                error_bounds['capture_quality_score'] = quality_info.get('quality_score_before')
+                error_bounds['capture_quality_score_after'] = quality_info.get('quality_score_after')
+                error_bounds['capture_images_removed'] = quality_info.get('removed_images', 0)
+                error_bounds['capture_images_used'] = quality_info.get('used_images', len(images))
+
+            # Add confidence gating and diagnostics for depth-only mode
+            low_conf_threshold = self.config.scale_recovery.low_confidence_threshold
+            if scale_result.confidence < low_conf_threshold:
+                logger.warning(
+                    f"Low scale confidence ({scale_result.confidence:.2f} < {low_conf_threshold:.2f}); "
+                    "measurement reliability is limited"
+                )
+                error_bounds['low_confidence_warning'] = True
+                error_bounds['relative_error_percent'] = max(
+                    float(error_bounds.get('relative_error_percent', 0.0)),
+                    25.0
+                )
+                error_bounds['quality'] = 'poor'
+
+            aligned_estimate = next(
+                (e for e in scale_result.individual_estimates if e.method == 'depth_aligned'),
+                None
+            )
+            if aligned_estimate and aligned_estimate.metadata:
+                error_bounds['depth_aligned_views_used'] = aligned_estimate.metadata.get('views_used')
+                error_bounds['depth_aligned_scale_dispersion'] = aligned_estimate.metadata.get('scale_dispersion')
+
             logger.info(f"Estimated error: ±{error_bounds['relative_error_percent']:.1f}%")
             
             # Save outputs if configured
@@ -314,10 +377,121 @@ class MeasurementSystemGPU:
             raise RuntimeError(f"Measurement failed: {e}")
         
         finally:
-            # Cleanup
-            torch.cuda.empty_cache()
+            # Periodic cleanup to avoid allocator thrash
+            if self._measure_calls % self._cache_cleanup_interval == 0:
+                torch.cuda.empty_cache()
             if self.config.enable_profiling:
                 self._log_gpu_stats()
+
+    def _prefilter_low_quality_images(
+        self,
+        images: List[np.ndarray],
+        image_paths: Optional[List[Path]]
+    ) -> Tuple[List[np.ndarray], Optional[List[Path]], Optional[Dict[str, float]]]:
+        """Drop lowest-quality images for more stable reconstruction when quality is poor."""
+        if not self.config.enable_capture_quality_filter:
+            return images, image_paths, None
+        if not image_paths or len(images) != len(image_paths):
+            return images, image_paths, None
+        if len(images) <= self.config.min_images_after_quality_filter:
+            return images, image_paths, None
+
+        try:
+            paths = [Path(path) for path in image_paths]
+            quality_report = analyze_capture_quality(paths)
+            summary = quality_report['summary']
+            quality_before = float(summary['quality_score'])
+
+            info = {
+                'quality_score_before': quality_before,
+                'quality_score_after': quality_before,
+                'removed_images': 0,
+                'used_images': len(images)
+            }
+
+            if quality_before >= self.config.capture_quality_threshold:
+                logger.info(
+                    f"Capture quality acceptable ({quality_before:.3f}); no prefiltering applied"
+                )
+                return images, image_paths, info
+
+            max_removable = len(images) - self.config.min_images_after_quality_filter
+            drop_fraction = self._adaptive_quality_drop_fraction(summary)
+            desired_remove = int(len(images) * drop_fraction)
+            remove_count = min(max(desired_remove, 1), max_removable)
+
+            if remove_count <= 0:
+                logger.info("Capture quality low but prefiltering skipped due to min image constraints")
+                return images, image_paths, info
+
+            scored = []
+            for idx, item in enumerate(quality_report['images']):
+                blur = float(item['blur_score'])
+                exposure_mean = float(item['exposure_mean'])
+                under = float(item['underexposed_ratio'])
+                over = float(item['overexposed_ratio'])
+
+                blur_norm = float(np.clip(np.log1p(blur) / np.log1p(350.0), 0.0, 1.0))
+                exposure_balance = float(np.clip(1.0 - abs(exposure_mean - 0.5) / 0.5, 0.0, 1.0))
+                clipping_penalty = float(np.clip(1.0 - (under + over), 0.0, 1.0))
+                score = 0.50 * blur_norm + 0.25 * exposure_balance + 0.25 * clipping_penalty
+                scored.append((idx, score))
+
+            scored.sort(key=lambda pair: pair[1], reverse=True)
+            keep_indices = sorted(idx for idx, _ in scored[:len(images) - remove_count])
+
+            filtered_images = [images[idx] for idx in keep_indices]
+            filtered_paths = [image_paths[idx] for idx in keep_indices]
+
+            filtered_report = analyze_capture_quality([Path(path) for path in filtered_paths])
+            quality_after = float(filtered_report['summary']['quality_score'])
+
+            info.update({
+                'quality_score_after': quality_after,
+                'removed_images': remove_count,
+                'used_images': len(filtered_images),
+                'quality_drop_fraction_applied': drop_fraction
+            })
+
+            logger.warning(
+                f"Low capture quality ({quality_before:.3f} < {self.config.capture_quality_threshold:.3f}); "
+                f"drop_fraction={drop_fraction:.3f}, removed {remove_count} low-quality images, "
+                f"quality {quality_before:.3f} -> {quality_after:.3f}"
+            )
+
+            return filtered_images, filtered_paths, info
+
+        except Exception as error:
+            logger.warning(f"Capture quality prefilter failed; using original images: {error}")
+            return images, image_paths, None
+
+    def _adaptive_quality_drop_fraction(self, quality_summary: Dict[str, float]) -> float:
+        """Adapt pruning strength using quality gap and overlap stability."""
+        base_fraction = float(self.config.quality_drop_fraction)
+        if not self.config.enable_adaptive_quality_drop:
+            return base_fraction
+
+        quality_score = float(quality_summary.get('quality_score', 0.0))
+        overlap_median = float(quality_summary.get('overlap_median', 0.0))
+        overlap_std = float(quality_summary.get('overlap_std', 0.0))
+
+        threshold = float(self.config.capture_quality_threshold)
+        quality_gap = np.clip((threshold - quality_score) / max(threshold, 1e-6), 0.0, 1.0)
+
+        target_overlap = 0.15
+        overlap_penalty = np.clip((target_overlap - overlap_median) / target_overlap, 0.0, 1.0)
+        overlap_dispersion = overlap_std / max(overlap_median, 1e-6)
+        dispersion_penalty = np.clip(overlap_dispersion / 0.8, 0.0, 1.0)
+
+        adaptive_multiplier = 1.0 + 0.6 * quality_gap + 0.4 * overlap_penalty + 0.3 * dispersion_penalty
+        adaptive_fraction = base_fraction * adaptive_multiplier
+        adaptive_fraction = float(np.clip(
+            adaptive_fraction,
+            self.config.adaptive_quality_drop_min,
+            self.config.adaptive_quality_drop_max,
+        ))
+
+        return adaptive_fraction
     
     def _transfer_to_gpu(self, images: List[np.ndarray]) -> torch.Tensor:
         """
@@ -371,12 +545,23 @@ class MeasurementSystemGPU:
         else:
             points_np = points
         
-        # Remove outliers using both methods
-        # NOTE: Keeping STRICT filtering (eps=0.05) because with 707 sparse points,
-        # we need aggressive filtering to remove background/noise points.
-        # Less strict filtering includes too many outliers, making bbox way too large.
+        # Remove outliers with adaptive DBSCAN parameters
         logger.info(f"Processing {len(points_np)} points...")
-        points_clean = remove_outliers(points_np, method='both', eps=0.05, min_samples=10)
+        points_clean = self._adaptive_outlier_filter(points_np)
+
+        # Fallback when filtering is too aggressive
+        minimum_points = max(30, int(0.03 * len(points_np)))
+        if len(points_clean) < minimum_points:
+            logger.warning(
+                f"Adaptive filtering kept too few points ({len(points_clean)}<{minimum_points}); "
+                "falling back to statistical filtering"
+            )
+            points_clean = remove_outliers(points_np, method='statistical', std_ratio=2.5)
+
+        if len(points_clean) < 10:
+            logger.warning("Too few points after filtering; reverting to unfiltered points")
+            points_clean = points_np
+
         logger.info(f"After outlier removal: {len(points_clean)} points")
         
         # Compute oriented bounding box for better accuracy
@@ -423,6 +608,7 @@ class MeasurementSystemGPU:
             'center_y': float(center_cm[1]),
             'center_z': float(center_cm[2]),
             'num_points': len(points_clean),
+            'num_points_raw': len(points_np),
             'point_cloud_quality': quality['overall_quality']
         }
         
@@ -461,6 +647,32 @@ class MeasurementSystemGPU:
             logger.debug(f"Removed {num_removed} outlier points")
         
         return points_filtered
+
+    def _adaptive_outlier_filter(self, points_np: np.ndarray) -> np.ndarray:
+        """Adaptive two-stage outlier filtering based on point spacing."""
+        if len(points_np) < 40:
+            return points_np
+
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(points_np)
+            distances, _ = tree.query(points_np, k=2)
+            nn_distances = distances[:, 1]
+
+            base_spacing = float(np.median(nn_distances))
+            eps = float(np.clip(base_spacing * 3.0, 0.01, 0.20))
+            min_samples = int(np.clip(len(points_np) * 0.01, 8, 20))
+
+            logger.info(
+                f"Adaptive outlier filter: spacing={base_spacing:.4f}, eps={eps:.4f}, "
+                f"min_samples={min_samples}"
+            )
+            return remove_outliers(points_np, method='both', eps=eps, min_samples=min_samples)
+
+        except Exception as error:
+            logger.warning(f"Adaptive outlier filtering failed, using default: {error}")
+            return remove_outliers(points_np, method='both', eps=0.05, min_samples=10)
     
     def _log_gpu_stats(self):
         """Log GPU memory and performance statistics."""
@@ -503,8 +715,8 @@ class MeasurementSystemGPU:
         logger.info("Warming up...")
         try:
             self.measure(test_images)
-        except:
-            pass  # Warmup may fail, that's okay
+        except Exception as error:
+            logger.warning(f"Warmup failed (continuing benchmark): {error}")
         
         # Benchmark runs
         for i in range(num_runs):
@@ -534,6 +746,207 @@ class MeasurementSystemGPU:
         }
         
         logger.info(f"Benchmark complete: {metrics['mean_time']:.2f}s ± {metrics['std_time']:.2f}s")
-        
+
         return metrics
+
+    def _apply_geometric_validation(
+        self,
+        points: np.ndarray,
+        depth_maps: torch.Tensor,
+        camera_poses: List,
+        camera_intrinsics: List,
+        bbox
+    ) -> Tuple[Optional[object], Dict]:
+        """
+        Apply geometric validation to refine measurements.
+
+        Uses plane detection, prism fitting, and epipolar consistency
+        to validate and potentially refine the bounding box.
+
+        Args:
+            points: Point cloud [N, 3]
+            depth_maps: Depth maps [V, H, W]
+            camera_poses: List of camera pose matrices
+            camera_intrinsics: List of camera intrinsics
+            bbox: Initial bounding box
+
+        Returns:
+            Tuple of (refined_bbox or None, diagnostics)
+        """
+        diagnostics = {}
+
+        if not self.config.geometric_priors.enable_geometric_refinement:
+            return None, diagnostics
+
+        try:
+            from ..geometry.geometric_validator import GeometricValidator
+
+            validator = GeometricValidator(self.config.geometric_priors)
+
+            result = validator.validate_and_refine(
+                points,
+                depth_maps=depth_maps,
+                camera_poses=camera_poses,
+                camera_intrinsics=camera_intrinsics,
+                initial_bbox=bbox
+            )
+
+            diagnostics['geometric_validation'] = result.diagnostics
+            diagnostics['geometric_confidence'] = result.confidence_score
+            diagnostics['is_valid_geometry'] = result.is_valid
+
+            if result.prism_fit:
+                diagnostics['prism_dimensions'] = result.prism_fit.dimensions.tolist()
+                diagnostics['prism_residual'] = result.prism_fit.residual
+
+            if result.plane_detections:
+                diagnostics['num_planes'] = len(result.plane_detections)
+
+            logger.info(
+                f"Geometric validation: valid={result.is_valid}, "
+                f"confidence={result.confidence_score:.2f}"
+            )
+
+            return result.refined_bbox, diagnostics
+
+        except ImportError as e:
+            logger.debug(f"Geometric validation not available: {e}")
+            return None, {'error': 'not_available'}
+        except Exception as e:
+            logger.warning(f"Geometric validation failed: {e}")
+            return None, {'error': str(e)}
+
+    def _estimate_uncertainty_bounds(
+        self,
+        depth_estimations: List[DepthEstimation],
+        measurements: Dict[str, float]
+    ) -> Dict[str, float]:
+        """
+        Estimate uncertainty bounds from depth estimation uncertainty.
+
+        Args:
+            depth_estimations: List of depth estimations with uncertainty
+            measurements: Current measurements
+
+        Returns:
+            Dictionary with uncertainty bounds for each measurement
+        """
+        bounds = {
+            'width_uncertainty': 0.0,
+            'height_uncertainty': 0.0,
+            'depth_uncertainty': 0.0,
+            'volume_uncertainty': 0.0
+        }
+
+        if not depth_estimations:
+            return bounds
+
+        # Collect uncertainty statistics
+        uncertainties = []
+        for est in depth_estimations:
+            if est.uncertainty_map is not None:
+                mean_unc = float(est.uncertainty_map.mean())
+                uncertainties.append(mean_unc)
+            elif est.mc_variance is not None:
+                mean_var = float(est.mc_variance.mean())
+                uncertainties.append(np.sqrt(mean_var))
+
+        if not uncertainties:
+            return bounds
+
+        # Average uncertainty across views
+        avg_uncertainty = np.mean(uncertainties)
+
+        # Scale uncertainty to measurement units
+        # Uncertainty in depth translates to uncertainty in measurements
+        scale_factor = avg_uncertainty * 100  # Convert to cm
+
+        bounds['width_uncertainty'] = measurements.get('width', 0) * avg_uncertainty
+        bounds['height_uncertainty'] = measurements.get('height', 0) * avg_uncertainty * 1.1
+        bounds['depth_uncertainty'] = measurements.get('depth', 0) * avg_uncertainty * 1.2
+
+        # Volume uncertainty (propagate through product)
+        if 'volume_cm3' in measurements:
+            vol = measurements['volume_cm3']
+            rel_unc = 3 * avg_uncertainty  # Approximate for product
+            bounds['volume_uncertainty'] = vol * rel_unc
+
+        bounds['mean_depth_uncertainty'] = float(avg_uncertainty)
+
+        return bounds
+
+    def measure_with_uncertainty(
+        self,
+        images: List[np.ndarray],
+        image_paths: Optional[List[Path]] = None,
+        imu_data: Optional[List[Dict]] = None,
+        metadata: Optional[List[Dict]] = None,
+        known_intrinsics: Optional[CameraIntrinsics] = None
+    ) -> MeasurementResult:
+        """
+        Measure dimensions with full uncertainty quantification.
+
+        Extended version of measure() that computes uncertainty bounds
+        and applies geometric validation.
+
+        Args:
+            images: List of input images
+            image_paths: Optional paths to image files
+            imu_data: Optional IMU sensor data
+            metadata: Optional image metadata
+            known_intrinsics: Optional known camera calibration
+
+        Returns:
+            MeasurementResult with uncertainty bounds
+        """
+        # Run base measurement
+        result = self.measure(
+            images,
+            image_paths=image_paths,
+            imu_data=imu_data,
+            metadata=metadata,
+            known_intrinsics=known_intrinsics
+        )
+
+        # Add uncertainty bounds from depth estimation
+        if result.depth_estimations:
+            uncertainty_bounds = self._estimate_uncertainty_bounds(
+                result.depth_estimations,
+                result.measurements
+            )
+            result.uncertainty_bounds = uncertainty_bounds
+
+            # Get model name from first estimation
+            if result.depth_estimations[0].model_name:
+                result.model_used = result.depth_estimations[0].model_name
+
+        # Apply geometric validation if configured
+        if (self.config.geometric_priors.enable_geometric_refinement and
+            result.reconstruction.points is not None):
+
+            points_np = result.reconstruction.points
+            if isinstance(points_np, torch.Tensor):
+                points_np = points_np.cpu().numpy()
+
+            depth_maps = None
+            if result.depth_estimations:
+                depth_maps = torch.stack([d.depth_map for d in result.depth_estimations])
+
+            refined_bbox, geo_diag = self._apply_geometric_validation(
+                points_np,
+                depth_maps,
+                result.reconstruction.camera_poses or [],
+                result.reconstruction.camera_intrinsics or [],
+                None
+            )
+
+            if geo_diag:
+                if result.error_bounds is None:
+                    result.error_bounds = {}
+                result.error_bounds.update(geo_diag)
+
+            if geo_diag.get('geometric_confidence'):
+                result.geometric_fit_score = geo_diag['geometric_confidence']
+
+        return result
 

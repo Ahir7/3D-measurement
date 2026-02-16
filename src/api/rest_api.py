@@ -9,23 +9,66 @@ import numpy as np
 import logging
 import tempfile
 import shutil
+import json
+import asyncio
+from contextlib import asynccontextmanager
 from typing import List, Optional, Dict
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 import cv2
 
 from ..core.measurement_system_gpu import MeasurementSystemGPU
 from ..core.config import SystemConfig, get_gpu_info
+from .reliability import OOMCircuitBreaker, OOMCircuitBreakerConfig
 
 logger = logging.getLogger(__name__)
+
+# Global measurement system instance
+measurement_system: Optional[MeasurementSystemGPU] = None
+MAX_CONCURRENT_MEASUREMENTS = 1
+REQUEST_QUEUE_TIMEOUT_SECONDS = 2.0
+measure_semaphore = asyncio.Semaphore(MAX_CONCURRENT_MEASUREMENTS)
+oom_breaker = OOMCircuitBreaker(
+    OOMCircuitBreakerConfig(max_consecutive_oom=3, cooldown_seconds=45.0)
+)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize and tear down measurement resources for API lifecycle."""
+    global measurement_system
+
+    try:
+        logger.info("Initializing 3D measurement system...")
+        if not torch.cuda.is_available():
+            raise RuntimeError("GPU not available - system requires CUDA")
+
+        config = SystemConfig()
+        measurement_system = MeasurementSystemGPU(config)
+        logger.info("System initialized successfully")
+    except Exception as error:
+        logger.error(f"Failed to initialize system: {error}")
+        measurement_system = None
+        logger.warning("API started in degraded mode; /measure and /benchmark will return 503")
+
+    try:
+        yield
+    finally:
+        logger.info("Shutting down system...")
+        if measurement_system is not None:
+            torch.cuda.empty_cache()
+            measurement_system = None
+        logger.info("Shutdown complete")
 
 # Initialize FastAPI app
 app = FastAPI(
     title="3D Measurement API",
     description="GPU-accelerated 3D measurement system using COLMAP and Metric3D",
     version="2.0.0",
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc"
 )
@@ -34,13 +77,10 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Global measurement system instance
-measurement_system: Optional[MeasurementSystemGPU] = None
 
 
 # Pydantic models
@@ -63,6 +103,7 @@ class HealthResponse(BaseModel):
     gpu_available: bool
     gpu_info: Dict
     system_ready: bool
+    reliability: Dict
 
 
 class BenchmarkRequest(BaseModel):
@@ -71,46 +112,6 @@ class BenchmarkRequest(BaseModel):
     num_images: int = Field(default=5, ge=3, le=20)
     image_size: tuple = Field(default=(1024, 1024))
     num_runs: int = Field(default=3, ge=1, le=10)
-
-
-# Startup and shutdown events
-@app.on_event("startup")
-async def startup_event():
-    """Initialize measurement system on startup."""
-    global measurement_system
-    
-    try:
-        logger.info("Initializing 3D measurement system...")
-        
-        # Check GPU availability
-        if not torch.cuda.is_available():
-            raise RuntimeError("GPU not available - system requires CUDA")
-        
-        # Initialize system
-        config = SystemConfig()
-        measurement_system = MeasurementSystemGPU(config)
-        
-        logger.info("System initialized successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to initialize system: {e}")
-        measurement_system = None
-        raise
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown."""
-    global measurement_system
-    
-    logger.info("Shutting down system...")
-    
-    if measurement_system:
-        # Clear GPU memory
-        torch.cuda.empty_cache()
-        measurement_system = None
-    
-    logger.info("Shutdown complete")
 
 
 # API endpoints
@@ -139,7 +140,39 @@ async def health_check():
         status="healthy" if measurement_system else "degraded",
         gpu_available=gpu_info['available'],
         gpu_info=gpu_info,
-        system_ready=measurement_system is not None
+        system_ready=measurement_system is not None,
+        reliability={
+            'measure_slots': MAX_CONCURRENT_MEASUREMENTS,
+            'queue_timeout_seconds': REQUEST_QUEUE_TIMEOUT_SECONDS,
+            'oom_circuit_breaker': oom_breaker.state(),
+        }
+    )
+
+
+async def _acquire_measure_slot() -> bool:
+    """Acquire measurement concurrency slot with bounded wait."""
+    try:
+        await asyncio.wait_for(
+            measure_semaphore.acquire(),
+            timeout=REQUEST_QUEUE_TIMEOUT_SECONDS,
+        )
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _raise_if_oom_breaker_open() -> None:
+    if not oom_breaker.is_open():
+        return
+
+    retry_after = max(1, int(round(oom_breaker.retry_after_seconds())))
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "GPU protection is active after repeated out-of-memory events. "
+            f"Retry in ~{retry_after}s with fewer/lower-resolution images."
+        ),
+        headers={"Retry-After": str(retry_after)}
     )
 
 
@@ -168,6 +201,8 @@ async def measure_endpoint(
             status_code=503,
             detail="Measurement system not initialized"
         )
+
+    _raise_if_oom_breaker_open()
     
     # Validate inputs
     if len(files) < 3:
@@ -183,8 +218,19 @@ async def measure_endpoint(
         )
     
     temp_dir = None
+    slot_acquired = False
     
     try:
+        slot_acquired = await _acquire_measure_slot()
+        if not slot_acquired:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Measurement queue is busy. "
+                    "Try again shortly or reduce concurrent client requests."
+                )
+            )
+
         # Create temporary directory for images
         temp_dir = tempfile.mkdtemp()
         temp_path = Path(temp_dir)
@@ -195,7 +241,7 @@ async def measure_endpoint(
         
         for i, file in enumerate(files):
             # Validate file type
-            if not file.content_type.startswith('image/'):
+            if not file.content_type or not file.content_type.startswith('image/'):
                 raise HTTPException(
                     status_code=400,
                     detail=f"File {file.filename} is not an image"
@@ -224,13 +270,23 @@ async def measure_endpoint(
         # Parse optional data
         imu_parsed = None
         if imu_data:
-            import json
-            imu_parsed = json.loads(imu_data)
+            try:
+                imu_parsed = json.loads(imu_data)
+            except json.JSONDecodeError as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid imu_data JSON: {error.msg}"
+                )
         
         metadata_parsed = None
         if metadata:
-            import json
-            metadata_parsed = json.loads(metadata)
+            try:
+                metadata_parsed = json.loads(metadata)
+            except json.JSONDecodeError as error:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid metadata JSON: {error.msg}"
+                )
         
         # Run measurement
         logger.info(f"Processing {len(images)} images...")
@@ -240,6 +296,8 @@ async def measure_endpoint(
             imu_data=imu_parsed,
             metadata=metadata_parsed
         )
+
+        oom_breaker.record_success()
         
         # Convert to response model
         response = MeasurementResponse(**result.to_dict())
@@ -249,6 +307,38 @@ async def measure_endpoint(
         
     except HTTPException:
         raise
+
+    except torch.cuda.OutOfMemoryError:
+        opened = oom_breaker.record_oom()
+        torch.cuda.empty_cache()
+        logger.error(
+            "Measurement failed: CUDA OOM (breaker_open=%s, retry_after=%.1fs)",
+            opened,
+            oom_breaker.retry_after_seconds(),
+        )
+        raise HTTPException(
+            status_code=507,
+            detail="GPU out of memory. Try fewer images or lower resolution."
+        )
+
+    except RuntimeError as error:
+        if "out of memory" in str(error).lower() and "cuda" in str(error).lower():
+            opened = oom_breaker.record_oom()
+            torch.cuda.empty_cache()
+            logger.error(
+                "Measurement failed: CUDA runtime OOM (breaker_open=%s, retry_after=%.1fs)",
+                opened,
+                oom_breaker.retry_after_seconds(),
+            )
+            raise HTTPException(
+                status_code=507,
+                detail="GPU out of memory. Try fewer images or lower resolution."
+            )
+        logger.error(f"Measurement failed: {error}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Measurement processing failed: {str(error)}"
+        )
     
     except Exception as e:
         logger.error(f"Measurement failed: {e}")
@@ -258,6 +348,9 @@ async def measure_endpoint(
         )
     
     finally:
+        if slot_acquired:
+            measure_semaphore.release()
+
         # Cleanup temporary directory
         if temp_dir and Path(temp_dir).exists():
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -282,6 +375,8 @@ async def benchmark_endpoint(request: BenchmarkRequest):
             status_code=503,
             detail="Measurement system not initialized"
         )
+
+    _raise_if_oom_breaker_open()
     
     try:
         logger.info(f"Running benchmark: {request.dict()}")
@@ -329,14 +424,17 @@ async def gpu_stats():
 
 # Error handlers
 @app.exception_handler(torch.cuda.OutOfMemoryError)
-async def cuda_oom_handler(request, exc):
+async def cuda_oom_handler(request: Request, exc: torch.cuda.OutOfMemoryError):
     """Handle CUDA out of memory errors."""
-    logger.error("GPU out of memory")
+    opened = oom_breaker.record_oom()
+    logger.error("GPU out of memory (breaker_open=%s)", opened)
     torch.cuda.empty_cache()
     
-    return HTTPException(
+    return JSONResponse(
         status_code=507,
-        detail="GPU out of memory. Try reducing image size or number of images."
+        content={
+            "detail": "GPU out of memory. Try reducing image size or number of images."
+        }
     )
 
 

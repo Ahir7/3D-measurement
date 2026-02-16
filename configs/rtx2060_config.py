@@ -57,7 +57,7 @@ def get_rtx2060_config() -> SystemConfig:
             use_mixed_precision=True,
             compile_model=False,  # Disabled due to 10+ min compilation time
             use_tensorrt=False,
-            depth_scale_factor=0.2214,
+            depth_scale_factor=1.0,
             min_depth=0.1,
             max_depth=100.0,
             near_depth=1.0,  # 1m for typical indoor close objects
@@ -75,6 +75,8 @@ def get_rtx2060_config() -> SystemConfig:
             imu_gravity=(0.0, 0.0, -9.81),
             min_confidence=0.0,
             min_methods_required=1,
+            depth_confidence_min=0.45,
+            depth_confidence_weight_power=1.4,
             depth_only_calibration=1.0
         ),
         
@@ -83,6 +85,13 @@ def get_rtx2060_config() -> SystemConfig:
         max_image_size=2048,  # 2x increase (was 1024)
         min_images=15,
         max_images=50,  # 2x increase (was 25)
+        enable_capture_quality_filter=True,
+        capture_quality_threshold=0.45,
+        quality_drop_fraction=0.20,
+        enable_adaptive_quality_drop=True,
+        adaptive_quality_drop_min=0.10,
+        adaptive_quality_drop_max=0.35,
+        min_images_after_quality_filter=15,
         
         # Output settings
         output_dir="output",

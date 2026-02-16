@@ -71,6 +71,7 @@ class ScaleOptimizer:
         images: torch.Tensor,
         reconstruction: Dict,
         depth_maps: Optional[torch.Tensor] = None,
+        confidence_maps: Optional[torch.Tensor] = None,
         imu_data: Optional[List[Dict]] = None,
         metadata: Optional[List[Dict]] = None
     ) -> ScaleResult:
@@ -81,6 +82,7 @@ class ScaleOptimizer:
             images: Input images [N, H, W, 3]
             reconstruction: 3D reconstruction with points and poses
             depth_maps: Optional depth maps from Metric3D
+            confidence_maps: Optional depth confidence maps from Metric3D
             imu_data: Optional IMU sensor data
             metadata: Optional image metadata
             
@@ -109,7 +111,8 @@ class ScaleOptimizer:
             if reconstruction.get('camera_intrinsics'):
                 aligned_estimate = self._estimate_from_depth_aligned(
                     depth_maps,
-                    reconstruction
+                    reconstruction,
+                    confidence_maps=confidence_maps
                 )
             if aligned_estimate:
                 estimates.append(aligned_estimate)
@@ -152,6 +155,76 @@ class ScaleOptimizer:
             individual_estimates=estimates,
             optimization_iterations=iterations
         )
+
+    def _fuse_view_scales(
+        self,
+        view_scales: List[float],
+        view_weights: List[float]
+    ) -> Optional[Tuple[float, Dict[str, float], np.ndarray, np.ndarray]]:
+        """Robustly fuse per-view scales using MAD filtering and weighted average."""
+        if not view_scales:
+            return None
+
+        scales = np.array(view_scales, dtype=np.float64)
+        weights = np.array(view_weights, dtype=np.float64)
+
+        if scales.shape[0] == 1:
+            diagnostics = {
+                'views_before_filter': 1,
+                'views_after_filter': 1,
+                'scale_std': 0.0,
+                'scale_dispersion': 0.0,
+            }
+            return float(scales[0]), diagnostics, scales, np.array([1.0], dtype=np.float64)
+
+        median_scale = np.median(scales)
+        mad_scale = np.median(np.abs(scales - median_scale)) + 1e-8
+        inlier_mask = np.abs(scales - median_scale) <= (2.5 * mad_scale)
+
+        if inlier_mask.sum() >= max(2, int(0.5 * len(scales))):
+            scales_filtered = scales[inlier_mask]
+            weights_filtered = weights[inlier_mask]
+        else:
+            scales_filtered = scales
+            weights_filtered = weights
+
+        weight_sum = weights_filtered.sum()
+        if weight_sum <= 1e-10:
+            weights_filtered = np.ones_like(weights_filtered) / len(weights_filtered)
+        else:
+            weights_filtered = weights_filtered / weight_sum
+
+        fused_scale = float(np.sum(scales_filtered * weights_filtered))
+        scale_std = float(np.std(scales_filtered))
+        scale_mean = float(np.mean(scales_filtered))
+        scale_dispersion = float(scale_std / (abs(scale_mean) + 1e-8))
+
+        diagnostics = {
+            'views_before_filter': int(len(scales)),
+            'views_after_filter': int(len(scales_filtered)),
+            'scale_std': scale_std,
+            'scale_dispersion': scale_dispersion,
+        }
+        return fused_scale, diagnostics, scales_filtered, weights_filtered
+
+    def _weighted_median(
+        self,
+        values: np.ndarray,
+        weights: np.ndarray
+    ) -> float:
+        """Compute weighted median of 1D values."""
+        if values.size == 0:
+            raise ValueError("values must be non-empty")
+
+        safe_weights = np.clip(weights.astype(np.float64), 1e-8, None)
+        order = np.argsort(values)
+        sorted_values = values[order]
+        sorted_weights = safe_weights[order]
+        cumulative = np.cumsum(sorted_weights)
+        cutoff = 0.5 * cumulative[-1]
+        median_idx = int(np.searchsorted(cumulative, cutoff, side='left'))
+        median_idx = min(max(median_idx, 0), sorted_values.shape[0] - 1)
+        return float(sorted_values[median_idx])
     
     def _estimate_from_markers(
         self,
@@ -389,7 +462,8 @@ class ScaleOptimizer:
     def _estimate_from_depth_aligned(
         self,
         depth_maps: torch.Tensor,
-        reconstruction: Dict
+        reconstruction: Dict,
+        confidence_maps: Optional[torch.Tensor] = None
     ) -> Optional[ScaleEstimate]:
         """Estimate scale by aligning COLMAP points with depth maps."""
         try:
@@ -461,6 +535,10 @@ class ScaleOptimizer:
                 t = pose_np[:3, 3]
 
                 depth_map = depth_maps[view_idx].detach().cpu().numpy()
+                confidence_map = None
+                if confidence_maps is not None and view_idx < confidence_maps.shape[0]:
+                    confidence_map = confidence_maps[view_idx].detach().cpu().numpy()
+
                 H, W = depth_map.shape
 
                 # Project points into current camera
@@ -486,6 +564,10 @@ class ScaleOptimizer:
                 if valid.sum() < 100:
                     continue
 
+                # Require sufficient image spread to avoid degenerate frontal-only fits
+                if (u[valid].max() - u[valid].min()) < 20 or (v[valid].max() - v[valid].min()) < 20:
+                    continue
+
                 u = u[valid]
                 v = v[valid]
                 depths_colmap = points_cam[valid, 2]
@@ -503,11 +585,36 @@ class ScaleOptimizer:
                     du * dv * depth_map[v0 + 1, u0 + 1]
                 )
 
+                confidence_samples = None
+                if confidence_map is not None:
+                    confidence_samples = (
+                        (1 - du) * (1 - dv) * confidence_map[v0, u0] +
+                        du * (1 - dv) * confidence_map[v0, u0 + 1] +
+                        (1 - du) * dv * confidence_map[v0 + 1, u0] +
+                        du * dv * confidence_map[v0 + 1, u0 + 1]
+                    )
+
                 valid_depths = depth_samples > 0.05
+
+                if confidence_samples is not None:
+                    conf_mask = confidence_samples >= self.config.depth_confidence_min
+                    valid_depths = valid_depths & conf_mask
+
                 if valid_depths.sum() < 50:
                     continue
 
                 ratios = depth_samples[valid_depths] / (depths_colmap[valid_depths] + 1e-6)
+                ratio_weights = None
+                if confidence_samples is not None:
+                    ratio_weights = np.clip(
+                        confidence_samples[valid_depths],
+                        self.config.depth_confidence_min,
+                        1.0
+                    )
+                    ratio_weights = np.power(
+                        ratio_weights,
+                        self.config.depth_confidence_weight_power
+                    )
 
                 if ratios.size < 50:
                     continue
@@ -521,38 +628,55 @@ class ScaleOptimizer:
                     continue
 
                 ratios_inliers = ratios[inliers]
-                scale_view = np.median(ratios_inliers)
-                dispersion = np.std(ratios_inliers)
+                if ratio_weights is not None:
+                    weights_inliers = ratio_weights[inliers]
+                    scale_view = self._weighted_median(ratios_inliers, weights_inliers)
+                    normalized_weights = weights_inliers / (weights_inliers.sum() + 1e-8)
+                    variance = np.sum(normalized_weights * (ratios_inliers - scale_view) ** 2)
+                    dispersion = float(np.sqrt(max(variance, 0.0)))
+                    mean_confidence = float(np.mean(np.clip(weights_inliers, 0.0, 1.0)))
+                else:
+                    scale_view = float(np.median(ratios_inliers))
+                    dispersion = float(np.std(ratios_inliers))
+                    mean_confidence = 1.0
 
                 inlier_ratio = inliers.sum() / len(ratios)
                 consistency = np.exp(-dispersion / (abs(scale_view) + 1e-6))
+                view_coverage = valid.sum() / max(1, points_np.shape[0])
 
                 per_view_scales.append(scale_view)
-                per_view_weights.append(max(inlier_ratio * consistency, 1e-3))
+                per_view_weights.append(
+                    max(inlier_ratio * consistency * np.sqrt(view_coverage + 1e-8) * mean_confidence, 1e-3)
+                )
 
             if not per_view_scales:
                 return None
 
-            per_view_scales = np.array(per_view_scales)
-            per_view_weights = np.array(per_view_weights)
-            per_view_weights = per_view_weights / per_view_weights.sum()
+            if len(per_view_scales) < self.config.depth_aligned_min_views:
+                logger.info(
+                    f"Depth-aligned scale rejected: only {len(per_view_scales)} valid views "
+                    f"(<{self.config.depth_aligned_min_views})"
+                )
+                return None
 
-            scale = float(np.sum(per_view_scales * per_view_weights))
+            fused = self._fuse_view_scales(per_view_scales, per_view_weights)
+            if fused is None:
+                return None
 
-            # Confidence combines view consistency and coverage
-            if len(per_view_scales) > 1:
-                scale_std = np.std(per_view_scales)
-                scale_mean = np.mean(per_view_scales)
-                view_consistency = np.exp(-scale_std / (abs(scale_mean) + 1e-6))
-            else:
-                view_consistency = 0.7
+            scale, diagnostics, scales_filtered, weights_filtered = fused
 
-            coverage = min(len(per_view_scales) / 10.0, 1.0)
-            confidence = (view_consistency * 0.6 + coverage * 0.4) * self.config.depth_weight
+            scale_std = diagnostics['scale_std']
+            scale_dispersion = diagnostics['scale_dispersion']
+
+            view_consistency = np.exp(-scale_dispersion)
+            coverage = min(diagnostics['views_after_filter'] / 10.0, 1.0)
+            confidence = (view_consistency * 0.65 + coverage * 0.35) * self.config.depth_weight
 
             logger.info(
-                f"Depth-aligned scale: {scale:.4f} from {len(per_view_scales)} views, "
-                f"consistency={view_consistency:.2f}, coverage={coverage:.2f}"
+                f"Depth-aligned scale: {scale:.4f} from {diagnostics['views_after_filter']} "
+                f"filtered views (raw={diagnostics['views_before_filter']}), "
+                f"dispersion={scale_dispersion:.3f}, consistency={view_consistency:.2f}, "
+                f"coverage={coverage:.2f}"
             )
 
             return ScaleEstimate(
@@ -560,9 +684,13 @@ class ScaleOptimizer:
                 scale_factor=float(scale),
                 confidence=float(confidence),
                 metadata={
-                    'views_used': len(per_view_scales),
-                    'weights': per_view_weights.tolist(),
-                    'view_scales': per_view_scales.tolist()
+                    'views_used': diagnostics['views_after_filter'],
+                    'views_raw': diagnostics['views_before_filter'],
+                    'confidence_threshold': self.config.depth_confidence_min,
+                    'weights': weights_filtered.tolist(),
+                    'view_scales': scales_filtered.tolist(),
+                    'scale_std': scale_std,
+                    'scale_dispersion': scale_dispersion
                 }
             )
 
@@ -672,4 +800,232 @@ class ScaleOptimizer:
         )
         
         return float(result.x[0]), int(result.nit)
+
+    def _apply_geometric_priors(
+        self,
+        points: np.ndarray,
+        depth_maps: torch.Tensor,
+        camera_poses: List[torch.Tensor],
+        camera_intrinsics: List = None,
+        config = None
+    ) -> Tuple[float, float, dict]:
+        """
+        Apply geometric constraints to refine scale estimate.
+
+        Uses plane detection and prism fitting to validate and
+        potentially correct the scale factor.
+
+        Args:
+            points: Point cloud [N, 3] at current scale
+            depth_maps: Depth maps [V, H, W]
+            camera_poses: List of camera pose matrices
+            camera_intrinsics: Optional camera intrinsics
+            config: Optional GeometricPriorsConfig
+
+        Returns:
+            Tuple of (scale_correction, confidence, diagnostics)
+        """
+        diagnostics = {}
+
+        try:
+            from ..geometry.geometric_validator import GeometricValidator
+            from ..core.config import GeometricPriorsConfig
+
+            # Use provided config or create default
+            if config is None:
+                config = GeometricPriorsConfig()
+
+            validator = GeometricValidator(config)
+
+            # Run geometric validation
+            result = validator.validate_and_refine(
+                points,
+                depth_maps=depth_maps,
+                camera_poses=camera_poses,
+                camera_intrinsics=camera_intrinsics
+            )
+
+            diagnostics['geometric_validation'] = result.diagnostics
+
+            # If prism fit is available, use it to estimate scale correction
+            scale_correction = 1.0
+            if result.prism_fit is not None:
+                # Compare prism dimensions to point cloud extent
+                points_extent = np.ptp(points, axis=0)
+                prism_dims = np.sort(result.prism_fit.dimensions)[::-1]
+                points_dims = np.sort(points_extent)[::-1]
+
+                # Scale correction is ratio of dimensions
+                if np.all(points_dims > 1e-6):
+                    dim_ratios = prism_dims / points_dims
+                    # Use median ratio to be robust
+                    scale_correction = float(np.median(dim_ratios))
+                    diagnostics['dimension_ratios'] = dim_ratios.tolist()
+
+            confidence = result.confidence_score
+            diagnostics['is_valid'] = result.is_valid
+
+            logger.info(
+                f"Geometric priors: correction={scale_correction:.4f}, "
+                f"confidence={confidence:.2f}, valid={result.is_valid}"
+            )
+
+            return scale_correction, confidence, diagnostics
+
+        except ImportError as e:
+            logger.warning(f"Geometric priors not available: {e}")
+            return 1.0, 0.5, {'error': str(e)}
+        except Exception as e:
+            logger.warning(f"Geometric priors failed: {e}")
+            return 1.0, 0.5, {'error': str(e)}
+
+    def _validate_with_planes(
+        self,
+        scale_factor: float,
+        points: np.ndarray
+    ) -> Tuple[float, dict]:
+        """
+        Validate scale using detected plane orthogonality.
+
+        For box-like objects, planes should be mutually orthogonal.
+        Scale errors can cause apparent non-orthogonality.
+
+        Args:
+            scale_factor: Current scale factor
+            points: Point cloud [N, 3]
+
+        Returns:
+            Tuple of (validation_score, diagnostics)
+        """
+        diagnostics = {}
+
+        try:
+            from ..geometry.plane_detection import (
+                MultiPlaneRANSAC,
+                compute_plane_orthogonality
+            )
+
+            # Apply scale to points
+            scaled_points = points * scale_factor
+
+            # Detect planes
+            detector = MultiPlaneRANSAC(
+                n_iterations=500,
+                distance_threshold=0.01 * scale_factor,
+                min_inliers=30,
+                max_planes=6
+            )
+            planes = detector.detect_all(scaled_points)
+
+            diagnostics['num_planes'] = len(planes)
+
+            if len(planes) < 3:
+                return 0.5, diagnostics
+
+            # Check orthogonality
+            orth_score, orth_pairs = compute_plane_orthogonality(planes, tolerance_degrees=5.0)
+            diagnostics['orthogonality_score'] = orth_score
+            diagnostics['orthogonal_pairs'] = len(orth_pairs)
+
+            logger.debug(
+                f"Plane validation: {len(planes)} planes, "
+                f"orthogonality={orth_score:.2f}"
+            )
+
+            return orth_score, diagnostics
+
+        except ImportError:
+            return 0.5, {'error': 'Plane detection not available'}
+        except Exception as e:
+            logger.warning(f"Plane validation failed: {e}")
+            return 0.5, {'error': str(e)}
+
+    def recover_scale_with_geometric_priors(
+        self,
+        images: torch.Tensor,
+        reconstruction: Dict,
+        depth_maps: Optional[torch.Tensor] = None,
+        confidence_maps: Optional[torch.Tensor] = None,
+        imu_data: Optional[List[Dict]] = None,
+        metadata: Optional[List[Dict]] = None,
+        geometric_config = None
+    ) -> ScaleResult:
+        """
+        Recover scale with geometric prior refinement.
+
+        Extended version of recover_scale that incorporates
+        geometric constraints for improved accuracy.
+
+        Args:
+            images: Input images
+            reconstruction: 3D reconstruction
+            depth_maps: Depth maps
+            confidence_maps: Confidence maps
+            imu_data: IMU data
+            metadata: Image metadata
+            geometric_config: GeometricPriorsConfig
+
+        Returns:
+            ScaleResult with geometric refinement
+        """
+        # First get base scale estimate
+        base_result = self.recover_scale(
+            images, reconstruction,
+            depth_maps=depth_maps,
+            confidence_maps=confidence_maps,
+            imu_data=imu_data,
+            metadata=metadata
+        )
+
+        # Apply geometric priors if available
+        points = reconstruction.get('points')
+        camera_poses = reconstruction.get('camera_poses')
+        camera_intrinsics = reconstruction.get('camera_intrinsics')
+
+        if points is not None and depth_maps is not None:
+            if isinstance(points, torch.Tensor):
+                points_np = points.cpu().numpy()
+            else:
+                points_np = points
+
+            # Apply base scale
+            scaled_points = points_np * base_result.scale_factor
+
+            # Get geometric correction
+            geo_correction, geo_confidence, geo_diag = self._apply_geometric_priors(
+                scaled_points,
+                depth_maps,
+                camera_poses or [],
+                camera_intrinsics,
+                geometric_config
+            )
+
+            # Blend geometric correction based on confidence
+            if geo_confidence > 0.5:
+                blend_weight = (geo_confidence - 0.5) * 2  # 0 to 1
+                final_scale = base_result.scale_factor * (
+                    1.0 + blend_weight * (geo_correction - 1.0)
+                )
+                final_confidence = (
+                    base_result.confidence * (1 - blend_weight * 0.3) +
+                    geo_confidence * blend_weight * 0.3
+                )
+
+                # Add geometric estimate to results
+                geo_estimate = ScaleEstimate(
+                    method="geometric_priors",
+                    scale_factor=base_result.scale_factor * geo_correction,
+                    confidence=geo_confidence,
+                    metadata=geo_diag
+                )
+
+                return ScaleResult(
+                    scale_factor=final_scale,
+                    confidence=final_confidence,
+                    methods_used=base_result.methods_used + ['geometric_priors'],
+                    individual_estimates=base_result.individual_estimates + [geo_estimate],
+                    optimization_iterations=base_result.optimization_iterations
+                )
+
+        return base_result
 

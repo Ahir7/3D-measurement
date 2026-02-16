@@ -346,3 +346,179 @@ def compute_point_cloud_quality(points: np.ndarray) -> Dict[str, float]:
         'overall_quality': quality_score
     }
 
+
+def fit_rectangular_prism(
+    points: np.ndarray,
+    max_iterations: int = 100,
+    inlier_threshold: float = 0.02
+) -> Tuple[BoundingBox, float]:
+    """
+    Fit a rectangular prism (oriented bounding box) to point cloud.
+
+    Uses PCA for initial orientation followed by iterative refinement.
+
+    Args:
+        points: Input points [N, 3]
+        max_iterations: Maximum refinement iterations
+        inlier_threshold: Distance threshold for inliers (meters)
+
+    Returns:
+        Tuple of (BoundingBox, fit_residual)
+    """
+    if len(points) < 8:
+        raise ValueError("Need at least 8 points for prism fitting")
+
+    # Import here to avoid circular dependency
+    from ..geometry.prism_fitting import RectangularPrismFitter
+
+    fitter = RectangularPrismFitter(
+        max_iterations=max_iterations,
+        inlier_threshold=inlier_threshold
+    )
+
+    prism = fitter.fit(points)
+
+    # Convert to BoundingBox
+    bbox = BoundingBox(
+        width=float(prism.dimensions[0]),
+        height=float(prism.dimensions[1]),
+        depth=float(prism.dimensions[2]),
+        volume=float(np.prod(prism.dimensions)),
+        center=prism.center,
+        orientation=prism.rotation,
+        corners=prism.corners
+    )
+
+    return bbox, prism.residual
+
+
+def detect_planes_ransac(
+    points: np.ndarray,
+    max_planes: int = 6,
+    distance_threshold: float = 0.01,
+    min_inliers: int = 50
+) -> list:
+    """
+    Detect multiple planes in point cloud using RANSAC.
+
+    Args:
+        points: Input points [N, 3]
+        max_planes: Maximum number of planes to detect
+        distance_threshold: RANSAC inlier distance threshold
+        min_inliers: Minimum points per plane
+
+    Returns:
+        List of PlaneEstimate objects
+    """
+    # Import here to avoid circular dependency
+    from ..geometry.plane_detection import MultiPlaneRANSAC
+
+    detector = MultiPlaneRANSAC(
+        n_iterations=1000,
+        distance_threshold=distance_threshold,
+        min_inliers=min_inliers,
+        max_planes=max_planes
+    )
+
+    return detector.detect_all(points)
+
+
+def validate_box_topology(
+    planes: list,
+    tolerance_degrees: float = 5.0
+) -> Tuple[bool, float, Dict]:
+    """
+    Validate if detected planes form a box-like topology.
+
+    Checks for orthogonal and parallel plane pairs as expected
+    in rectangular boxes.
+
+    Args:
+        planes: List of PlaneEstimate objects
+        tolerance_degrees: Angle tolerance for orthogonality/parallelism
+
+    Returns:
+        Tuple of (is_valid, confidence_score, diagnostics)
+    """
+    # Import here to avoid circular dependency
+    from ..geometry.plane_detection import validate_box_topology as _validate
+
+    return _validate(planes, tolerance_degrees, tolerance_degrees)
+
+
+def compute_geometric_confidence(
+    points: np.ndarray,
+    bbox: BoundingBox
+) -> float:
+    """
+    Compute confidence score based on geometric fit quality.
+
+    Evaluates how well points fit the bounding box geometry.
+
+    Args:
+        points: Point cloud [N, 3]
+        bbox: Fitted bounding box
+
+    Returns:
+        Confidence score [0, 1]
+    """
+    # Transform points to bbox local coordinates
+    centered = points - bbox.center
+    local = centered @ bbox.orientation
+
+    # Get half-dimensions
+    half_dims = np.array([bbox.width, bbox.height, bbox.depth]) / 2
+
+    # Compute distance to surface for each point
+    scaled = local / (half_dims + 1e-6)
+    max_scaled = np.max(np.abs(scaled), axis=1)
+
+    # Points inside have max_scaled <= 1
+    inside = max_scaled <= 1.0
+    inside_ratio = np.mean(inside)
+
+    # Surface distance for points
+    surface_dist = (max_scaled - 1) * np.min(half_dims)
+    mean_dist = np.mean(np.abs(surface_dist))
+
+    # Confidence combines inside ratio and surface fit
+    fit_quality = np.exp(-mean_dist / (np.min(half_dims) + 0.01))
+    confidence = 0.6 * inside_ratio + 0.4 * fit_quality
+
+    return float(np.clip(confidence, 0, 1))
+
+
+def refine_bbox_with_prism(
+    points: np.ndarray,
+    initial_bbox: BoundingBox,
+    max_iterations: int = 50
+) -> BoundingBox:
+    """
+    Refine bounding box using iterative prism fitting.
+
+    Args:
+        points: Point cloud [N, 3]
+        initial_bbox: Initial bounding box estimate
+        max_iterations: Maximum iterations for refinement
+
+    Returns:
+        Refined BoundingBox
+    """
+    # Import here to avoid circular dependency
+    from ..geometry.prism_fitting import RectangularPrismFitter
+
+    fitter = RectangularPrismFitter(max_iterations=max_iterations)
+
+    # Use initial bbox orientation as hint (via plane detection)
+    prism = fitter.fit(points)
+
+    return BoundingBox(
+        width=float(prism.dimensions[0]),
+        height=float(prism.dimensions[1]),
+        depth=float(prism.dimensions[2]),
+        volume=float(np.prod(prism.dimensions)),
+        center=prism.center,
+        orientation=prism.rotation,
+        corners=prism.corners
+    )
+
